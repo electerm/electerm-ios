@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# generated build output (rebuilt by `npm run build` / CI)
+www/
+.gen/
+
+# generated native iOS project (rebuilt by `cap add ios` in CI)
+ios/
+
+# local signing key
+*.keystore
+*.p12

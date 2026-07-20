@@ -1,0 +1,108 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [ dev, main, build-ios ]
+  workflow_dispatch:
+
+# GitHub Actions already skips workflows when the commit message contains
+# [skip ci], [ci skip], [no ci], [skip actions], or [actions skip].
+# The job-level `if` below is an explicit, belt-and-suspenders guard.
+jobs:
+  build:
+    name: Build electerm iOS
+    runs-on: macos-latest
+    timeout-minutes: 120
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]') && !contains(github.event.head_commit.message, '[no ci]') && !contains(github.event.head_commit.message, '[skip actions]') && !contains(github.event.head_commit.message, '[actions skip]') }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Ensure CocoaPods is available
+        run: which pod >/dev/null 2>&1 || sudo gem install cocoapods
+
+      - name: ci init
+        run: npm config set legacy-peer-deps true
+
+      - name: Install root dependencies (electerm + build tooling)
+        run: npm i
+
+      - name: Install Capacitor dependencies
+        run: npm --prefix build/ios install
+
+      - name: Build web frontend + Node.js backend bundle
+        env:
+          # JWT secret for the on-device electerm server. Optional — build.mjs
+          # falls back to a random key when not provided. Set it for
+          # reproducible production builds:
+          #   gh secret set SERVER_SECRET --body "$(openssl rand -hex 32)"
+          SERVER_SECRET: ${{ secrets.SERVER_SECRET }}
+        run: npm run build:ios
+
+      - name: Add iOS platform (first run only)
+        run: cd build/ios && [ -d ios ] || npx cap add ios
+
+      - name: Sync Capacitor (copies web assets + native plugins)
+        run: cd build/ios && npx cap sync ios
+
+      - name: Patch Info.plist (allow cleartext localhost to the Node backend)
+        run: |
+          PLIST=build/ios/ios/App/App/Info.plist
+          if [ -f "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains dict" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1 dict" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1:NSExceptionAllowsInsecureHTTPLoads bool true" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1:NSIncludesSubdomains bool false" "$PLIST" 2>/dev/null || true
+            echo "Info.plist patched for localhost ATS"
+          else
+            echo "WARN: Info.plist not found at $PLIST"
+          fi
+
+      - name: Build iOS app (unsigned, device SDK)
+        run: |
+          cd build/ios/ios
+          xcodebuild -workspace App.xcworkspace -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: Locate built .app and upload as artifact
+        if: ${{ !cancelled() }}
+        run: |
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name 'App.app' -type d 2>/dev/null | head -1)
+          if [ -n "$APP" ]; then
+            echo "Built app: $APP"
+            du -sh "$APP"
+            mkdir -p /tmp/ios-build
+            cp -R "$APP" /tmp/ios-build/
+            echo "app-path=$APP" >> "$GITHUB_ENV"
+          else
+            echo "No App.app found in DerivedData"
+          fi
+
+      - name: Upload built .app (unsigned, proof of build)
+        if: ${{ !cancelled() && env.app-path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: electerm-ios-app-unsigned
+          path: /tmp/ios-build/App.app
+          if-no-files-found: warn
+          retention-days: 7
