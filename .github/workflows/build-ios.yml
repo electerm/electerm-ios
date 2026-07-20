@@ -30,6 +30,9 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
+      - name: Accept Xcode license
+        run: sudo xcodebuild -license accept || true
+
       - name: Ensure CocoaPods is available
         run: which pod >/dev/null 2>&1 || sudo gem install cocoapods
 
@@ -74,14 +77,17 @@ jobs:
 
       - name: Build iOS app (unsigned, device SDK)
         run: |
-          cd build/ios/ios
+          # Capacitor scaffolds the native project at build/ios/ios/App/
+          cd build/ios/ios/App
           xcodebuild -workspace App.xcworkspace -scheme App \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
             build
 
       - name: Locate built .app and upload as artifact
