@@ -87,9 +87,12 @@ jobs:
       - name: Build iOS app (unsigned, device SDK)
         run: |
           # Capacitor scaffolds the native project at build/ios/ios/App/
-          # (an .xcodeproj; the scheme/target is "App").
+          # (an .xcodeproj; the scheme is "App"). Building via the *scheme*
+          # (not -target) is required so Xcode generates the
+          # @capawesome/capacitor-nodejs SPM module map in the correct
+          # dependency order before the App target's clang dependency scan.
           cd build/ios/ios/App
-          xcodebuild -project App.xcodeproj -target App \
+          xcodebuild -project App.xcodeproj -scheme App \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
