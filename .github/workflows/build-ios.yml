@@ -75,11 +75,21 @@ jobs:
             echo "WARN: Info.plist not found at $PLIST"
           fi
 
+      - name: Resolve Swift Package Manager dependencies
+        run: |
+          # Capacitor 8 uses SPM (not CocoaPods): the native project is an
+          # .xcodeproj, not an .xcworkspace. Resolve packages explicitly so any
+          # network/resolution error surfaces here with a clear log.
+          cd build/ios/ios/App
+          xcodebuild -project App.xcodeproj -resolvePackageDependencies \
+            -configuration Release
+
       - name: Build iOS app (unsigned, device SDK)
         run: |
           # Capacitor scaffolds the native project at build/ios/ios/App/
+          # (an .xcodeproj; the scheme/target is "App").
           cd build/ios/ios/App
-          xcodebuild -workspace App.xcworkspace -scheme App \
+          xcodebuild -project App.xcodeproj -target App \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
