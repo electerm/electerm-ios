@@ -100,7 +100,24 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
           # Import the .p12 distribution certificate + private key
-          echo "$IOS_CERTIFICATE_P12_BASE64" | base64 --decode > /tmp/cert.p12
+          if [ -z "$IOS_CERTIFICATE_P12_BASE64" ]; then
+            echo "❌ IOS_CERTIFICATE_P12_BASE64 secret is empty."
+            echo "Set it with:"
+            echo "  base64 -i your-cert.p12 | gh secret set IOS_CERTIFICATE_P12_BASE64 --body -"
+            exit 1
+          fi
+          echo "$IOS_CERTIFICATE_P12_BASE64" | base64 --decode > /tmp/cert.p12 2>/dev/null || {
+            echo "❌ Failed to decode IOS_CERTIFICATE_P12_BASE64 — not valid base64."
+            echo "The secret must contain the base64-encoded .p12 certificate CONTENTS,"
+            echo "not a file path. Re-set it with:"
+            echo "  base64 -i your-cert.p12 | gh secret set IOS_CERTIFICATE_P12_BASE64 --body -"
+            exit 1
+          }
+          if [ ! -s /tmp/cert.p12 ]; then
+            echo "❌ Decoded .p12 file is empty."
+            exit 1
+          fi
+          echo "✅ Certificate decoded ($(wc -c < /tmp/cert.p12) bytes)"
           security import /tmp/cert.p12 \
             -k "$KEYCHAIN" \
             -P "$IOS_CERTIFICATE_PASSWORD" \
