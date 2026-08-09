@@ -75,7 +75,20 @@ profile (set in Xcode or via CI secrets).
 
 ## CI
 
+### Unsigned build (proof of build)
+
 `.github/workflows/build-ios.yml` builds the app on a macOS runner (Capacitor
 iOS + unsigned `xcodebuild`) and uploads the unsigned `.app` as a workflow
-artifact. It does **not** produce a signed IPA — add your Apple signing
-certificate + provisioning profile to the repo secrets to do so.
+artifact. It does **not** produce a signed IPA — useful for verifying that
+the code compiles and the web bundle is correct.
+
+### Signed build + App Store Connect upload
+
+`.github/workflows/build-ios-release.yml` builds a **signed IPA** and uploads
+it directly to App Store Connect. It requires Apple signing secrets to be set
+as GitHub repository secrets — see
+[`docs/ios-ci-signing-guide.md`](../../docs/ios-ci-signing-guide.md) for a
+step-by-step guide on how to obtain and configure them.
+
+Trigger by pushing to `release-ios`, `release`, or `build-ios-release`
+branches (or via manual workflow dispatch).
