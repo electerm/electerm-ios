@@ -227,15 +227,26 @@ jobs:
             const p = 'App.xcodeproj/project.pbxproj';
             let c = fs.readFileSync(p, 'utf8');
             const uuid = process.env.PP_UUID;
-            // Find the Release build config block that contains PRODUCT_BUNDLE_IDENTIFIER
-            // and inject PROVISIONING_PROFILE_SPECIFIER + PROVISIONING_PROFILE right after it.
+            // Replace existing signing style/identity in the pbxproj so the
+            // App target uses Manual signing with our distribution identity.
+            c = c.replace(/CODE_SIGN_STYLE = Automatic;/g, 'CODE_SIGN_STYLE = Manual;');
+            c = c.replace(/CODE_SIGN_IDENTITY = \".*?\";/g, 'CODE_SIGN_IDENTITY = \"iPhone Distribution\";');
+            // Insert PROVISIONING_PROFILE settings after EVERY occurrence of the
+            // bundle ID marker (both Debug and Release configs).
             const marker = 'PRODUCT_BUNDLE_IDENTIFIER = org.electerm.electerm-ios;';
-            const idx = c.indexOf(marker);
-            if (idx === -1) { console.error('Could not find PRODUCT_BUNDLE_IDENTIFIER in pbxproj'); process.exit(1); }
-            const insert = '\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = \"' + uuid + '\";\n\t\t\t\tPROVISIONING_PROFILE = \"' + uuid + '\";';
-            c = c.slice(0, idx + marker.length) + insert + c.slice(idx + marker.length);
+            const ppLine = 'PROVISIONING_PROFILE_SPECIFIER = \"' + uuid + '\";';
+            const ppUuidLine = 'PROVISIONING_PROFILE = \"' + uuid + '\";';
+            let count = 0;
+            let idx = c.indexOf(marker);
+            while (idx !== -1) {
+              const insert = '\n\t\t\t\t' + ppLine + '\n\t\t\t\t' + ppUuidLine;
+              c = c.slice(0, idx + marker.length) + insert + c.slice(idx + marker.length);
+              count++;
+              idx = c.indexOf(marker, idx + marker.length + insert.length);
+            }
+            if (count === 0) { console.error('Could not find PRODUCT_BUNDLE_IDENTIFIER in pbxproj'); process.exit(1); }
             fs.writeFileSync(p, c);
-            console.log('✅ Added PROVISIONING_PROFILE_SPECIFIER to App target only');
+            console.log('✅ Patched ' + count + ' build config(s) with manual signing + provisioning profile');
           "
 
       - name: Archive iOS app (signed)
