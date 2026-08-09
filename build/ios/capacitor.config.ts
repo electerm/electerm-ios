@@ -12,7 +12,7 @@ import { CapacitorConfig } from '@capacitor/cli'
 //                             the real app UI + the SSH/SFTP/... API on
 //                             http://127.0.0.1:5577.
 const config: CapacitorConfig = {
-  appId: 'org.electerm.electermios',
+  appId: 'org.electerm.electerm-ios',
   appName: 'electerm',
   webDir: 'www',
   // The loading page is served from the Capacitor local server and then

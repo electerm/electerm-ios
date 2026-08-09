@@ -61,6 +61,24 @@ jobs:
           SERVER_SECRET: ${{ secrets.SERVER_SECRET }}
         run: npm run build:ios
 
+      - name: Bypass Capacitor appId validation (Apple allows dashes, Capacitor does not)
+        run: |
+          # Capacitor enforces Java package name rules (no dashes) even for
+          # iOS-only apps. Apple's bundle ID rules are more permissive and
+          # allow dashes. Patch checkAppId() to skip validation so `cap add ios`
+          # accepts org.electerm.electerm-ios.
+          node -e "
+            const fs = require('fs');
+            const p = 'build/ios/node_modules/@capacitor/cli/dist/common.js';
+            let c = fs.readFileSync(p, 'utf8');
+            c = c.replace(
+              /async function checkAppId\(config, id\) \{[\s\S]*?\nexports\.checkAppId = checkAppId;/,
+              'async function checkAppId(config, id) { return null; }\nexports.checkAppId = checkAppId;'
+            );
+            fs.writeFileSync(p, c);
+            console.log('Patched Capacitor appId validation');
+          "
+
       - name: Add iOS platform (first run only)
         run: cd build/ios && [ -d ios ] || npx cap add ios
 
@@ -195,10 +213,34 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       # Archive (produces .xcarchive)
       # ──────────────────────────────────────────────────────────────────────
+      - name: Configure provisioning profile for App target only
+        env:
+          PP_UUID: ${{ env.provisioning-profile-uuid }}
+        run: |
+          # Set PROVISIONING_PROFILE_SPECIFIER only on the App target's Release
+          # build configuration inside project.pbxproj.  Passing it as a global
+          # xcodebuild override breaks SPM plugin targets (NodejsPlugin, etc.)
+          # which do not support provisioning profiles.
+          cd build/ios/ios/App
+          node -e "
+            const fs = require('fs');
+            const p = 'App.xcodeproj/project.pbxproj';
+            let c = fs.readFileSync(p, 'utf8');
+            const uuid = process.env.PP_UUID;
+            // Find the Release build config block that contains PRODUCT_BUNDLE_IDENTIFIER
+            // and inject PROVISIONING_PROFILE_SPECIFIER + PROVISIONING_PROFILE right after it.
+            const marker = 'PRODUCT_BUNDLE_IDENTIFIER = org.electerm.electerm-ios;';
+            const idx = c.indexOf(marker);
+            if (idx === -1) { console.error('Could not find PRODUCT_BUNDLE_IDENTIFIER in pbxproj'); process.exit(1); }
+            const insert = '\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = \"' + uuid + '\";\n\t\t\t\tPROVISIONING_PROFILE = \"' + uuid + '\";';
+            c = c.slice(0, idx + marker.length) + insert + c.slice(idx + marker.length);
+            fs.writeFileSync(p, c);
+            console.log('✅ Added PROVISIONING_PROFILE_SPECIFIER to App target only');
+          "
+
       - name: Archive iOS app (signed)
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          PP_UUID: ${{ env.provisioning-profile-uuid }}
         run: |
           cd build/ios/ios/App
 
@@ -215,7 +257,6 @@ jobs:
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             CODE_SIGN_STYLE="Manual" \
             CODE_SIGN_IDENTITY="iPhone Distribution" \
-            PROVISIONING_PROFILE_SPECIFIER="$PP_UUID" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
             ENABLE_USER_SCRIPT_SANDBOXING=NO \
@@ -242,7 +283,7 @@ jobs:
           ARCHIVE_PATH="$GITHUB_WORKSPACE/build/ios/output/electerm.xcarchive"
           EXPORT_DIR="$GITHUB_WORKSPACE/build/ios/output/ipa"
           PLIST_PATH="$GITHUB_WORKSPACE/build/ios/ExportOptions.plist"
-          BUNDLE_ID="org.electerm.electermios"
+          BUNDLE_ID="org.electerm.electerm-ios"
 
           mkdir -p "$EXPORT_DIR"
 
@@ -340,7 +381,7 @@ jobs:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
         run: |
           IPA_FILE="${{ env.ipa_path }}"
-          BUNDLE_ID="org.electerm.electermios"
+          BUNDLE_ID="org.electerm.electerm-ios"
 
           if [ -z "$IPA_FILE" ] || [ ! -f "$IPA_FILE" ]; then
             echo "❌ IPA file not found"
@@ -470,7 +511,7 @@ jobs:
           echo "- Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- Build number: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Bundle ID: org.electerm.electermios" >> $GITHUB_STEP_SUMMARY
+          echo "- Bundle ID: org.electerm.electerm-ios" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Artifacts:" >> $GITHUB_STEP_SUMMARY
           echo "- \`electerm-ios-ipa\` — signed IPA ready for App Store" >> $GITHUB_STEP_SUMMARY
