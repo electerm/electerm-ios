@@ -28,8 +28,9 @@ WebView (frontend)  ── http://127.0.0.1:5577 ──►  Node.js backend (on 
   terminal / serial features are not available on iOS yet.
 - The WebView first shows a small local "loading" page (`www/index.html`) that
   polls the backend and redirects once it is listening. Because the backend is
-  served over plain `http://127.0.0.1`, the CI workflow patches `Info.plist`
-  with an App Transport Security exception for localhost.
+  served over plain `http://127.0.0.1`, an App Transport Security (ATS)
+  exception for localhost is baked into `Info.plist` directly, and
+  `build.mjs --overlay-only` re-applies it after every `cap sync`.
 
 ## Prerequisites (local build)
 
@@ -54,7 +55,8 @@ cd build/ios
 npx cap add ios
 npx cap sync ios
 
-# 4. (CI does this for you) allow cleartext localhost in Info.plist, then open
+# 4. re-apply the Info.plist ATS overlay (after cap sync), then open
+node build.mjs --overlay-only
 npx cap open ios            # Xcode — build & run on a simulator / device
 ```
 

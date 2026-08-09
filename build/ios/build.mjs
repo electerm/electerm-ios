@@ -274,7 +274,7 @@ class Stmt {
 // dependencies (ssh2 → cpu-features → cpufeatures.node, sshcrypto.node).
 // Now that session.js uses static imports esbuild sees those .node files and
 // errors because it has no loader for them.  Marking them external is correct:
-// the native binaries are not present on Android anyway and the libraries that
+// the native binaries are not present on iOS anyway and the libraries that
 // use them have pure-JS fallbacks guarded by try/catch.
 const nativeNodePlugin = {
   name: 'native-node-files',
@@ -323,7 +323,7 @@ async function bundleBackend (shimPath) {
       // Replace it with the sql.js-backed synchronous shim produced above.
       'node:sqlite': shimPath
     },
-    // Native modules that are not built for Android yet. Keep them external so
+    // Native modules that are not built for iOS yet. Keep them external so
     // esbuild never tries to resolve them; the guarded `import()` calls in the
     // source fall back gracefully at runtime (see DISABLE_LOCAL_TERMINAL).
     external: [
@@ -363,7 +363,7 @@ import { fileURLToPath } from 'node:url'
 
 const __d = fileURLToPath(new URL('.', import.meta.url))
 
-// The embedded Node.js engine starts with cwd "/" (Android filesystem root),
+// The embedded Node.js engine starts with cwd "/" (the app sandbox root),
 // not the nodejs-project directory. electerm's runtime-constants.js reads
 // "package.json" via resolve(process.cwd(), 'package.json'), so without
 // chdir it tries to open "/package.json" -> ENOENT -> uncaught exception ->
@@ -379,7 +379,7 @@ process.env.PORT = '5577'
 // GitHub Action secret; locally it falls back to a fixed dev value.
 // The web UI auto-logs-in because ENABLE_AUTH is not set.
 process.env.SERVER_SECRET = ${JSON.stringify(SERVER_SECRET)}
-// No real pty on Android -> disable the local terminal feature.
+// No real pty on iOS -> disable the local terminal feature.
 process.env.DISABLE_LOCAL_TERMINAL = '1'
 // Tell the server where the pug views live (cwd is now the node project dir,
 // set above via process.chdir(__d)).
@@ -387,10 +387,10 @@ process.env.VIEW_FOLDER = resolve(__d, 'views')
 
 // Stable, app-private user-data directory.
 // The Node.js project is extracted by @capawesome/capacitor-nodejs into the
-// app's internal storage (getFilesDir()/nodejs). If we keep user data inside
-// that extracted project it can be wiped when the bundled node project is
-// refreshed on an app update. Putting it in a sibling directory keeps the
-// database, uploads and logs safe across updates.
+// app's internal storage. If we keep user data inside that extracted project
+// it can be wiped when the bundled node project is refreshed on an app
+// update. Putting it in a sibling directory keeps the database, uploads and
+// logs safe across updates.
 const userDataDir = (() => {
   try {
     const dir = resolve(__d, '..', 'electerm-data')
@@ -404,11 +404,10 @@ const userDataDir = (() => {
 })()
 process.env.DB_PATH = userDataDir
 
-// Android does not set a meaningful HOME directory. The Node.js runtime
-// (and os.homedir()) falls back to /data, which the app process cannot
-// access, causing "EACCES: permission denied" when electerm tries to
-// enumerate SSH keys from ~/.ssh.  Point HOME at the writable user-data
-// directory so that:
+// The embedded Node.js engine does not set a meaningful HOME directory on iOS.
+// os.homedir() may return a path the app cannot access, causing
+// "EACCES: permission denied" when electerm tries to enumerate SSH keys from
+// ~/.ssh.  Point HOME at the writable user-data directory so that:
 //   - os.homedir() returns a path the app can read/write
 //   - SSH keys stored in <userDataDir>/.ssh are found automatically
 //   - The .ssh dir is created once on first launch
@@ -430,76 +429,56 @@ await import('./app.bundle.mjs')
 }
 
 // --------------------------------------------------------------------------
-// 5. Overlay electerm icons/splash into the native Android project
+// 5. Post-sync overlay: patch Info.plist with ATS exception for localhost
 // --------------------------------------------------------------------------
-// `cap sync` regenerates android/app/src/main/res from Capacitor's default
-// templates, which replaces the electerm launcher icon with the generic
-// Capacitor icon. Applying the overlay *after* every sync keeps the correct
-// branding in place.  This function is a no-op when the android project has
-// not been created yet (e.g. during a pure `npm run build` before `cap add`).
+// `cap sync ios` regenerates Info.plist from Capacitor's default template,
+// which does NOT include an App Transport Security (ATS) exception.
+//
+// The on-device Node.js backend serves over plain http://127.0.0.1:5577.
+// iOS blocks insecure (http) loads by default via ATS, so without this
+// exception the WebView cannot reach the backend. We patch Info.plist after
+// every sync to ensure local builds work without manual steps.
+//
+// This function is a no-op when the native project has not been created yet
+// (e.g. during a pure `npm run build:ios` before `cap add ios`).
 function applyResOverlay () {
-  const overlayDir = path.resolve(__dirname, 'res-overlay')
-  const mainDir = path.resolve(__dirname, 'android', 'app', 'src', 'main')
-  const resDir = path.resolve(mainDir, 'res')
-  if (!fs.existsSync(resDir)) {
-    console.log('[ios] native project not found, skipping res-overlay (run cap add ios + cap sync first)')
+  const plistPath = path.resolve(__dirname, 'ios', 'App', 'App', 'Info.plist')
+  if (!fs.existsSync(plistPath)) {
+    console.log('[ios] native project not found, skipping Info.plist overlay (run cap add ios + cap sync first)')
     return
   }
-  console.log('[ios] applying res-overlay →', resDir)
+  console.log('[ios] patching Info.plist ATS exception for localhost…')
 
-  // AndroidManifest.xml must go at app/src/main/, NOT inside res/.
-  // cap sync regenerates the default Capacitor manifest; overwrite it with
-  // the electerm version that sets the custom icon, splash theme, and
-  // cleartext-traffic / network-security-config.
-  const manifestSrc = path.resolve(overlayDir, 'AndroidManifest.xml')
-  if (fs.existsSync(manifestSrc)) {
-    const manifestDest = path.resolve(mainDir, 'AndroidManifest.xml')
-    fs.copyFileSync(manifestSrc, manifestDest)
-    console.log('[ios] wrote', manifestDest)
+  let plist = fs.readFileSync(plistPath, 'utf8')
+
+  // Check if ATS is already present (re-runs after cap sync should be idempotent).
+  if (plist.includes('NSAppTransportSecurity')) {
+    console.log('[ios] NSAppTransportSecurity already present, skipping')
+    return
   }
 
-  // Copy every *other* entry (drawable, mipmap-*, values, xml, …) into res/.
-  for (const entry of fs.readdirSync(overlayDir, { withFileTypes: true })) {
-    if (entry.name === 'AndroidManifest.xml') continue
-    const s = path.join(overlayDir, entry.name)
-    const d = path.join(resDir, entry.name)
-    if (entry.isDirectory()) copyDir(s, d)
-    else fs.copyFileSync(s, d)
-  }
-
-  // Remove Capacitor's default resources that conflict with the overlay.
-  // These are generated by `cap add ios` / `cap sync` and must be
-  // deleted AFTER the overlay copy, otherwise they shadow or conflict with
-  // the electerm resources:
-  //
-  //   drawable-v24/ic_launcher_foreground.xml
-  //     Capacitor's vector foreground. On API 24+ (Android 7.0+) it takes
-  //     precedence over our density-specific ic_launcher_foreground.png, so
-  //     the adaptive icon shows the generic Capacitor logo instead of electerm.
-  //
-  //   values/ic_launcher_background.xml
-  //     Defines the same `ic_launcher_background` color as our
-  //     colors-electerm.xml → duplicate-resource build error.
-  //
-  //   drawable/splash.png
-  //     Same resource name as our drawable/splash.xml → conflict.
-  //
-  // NOTE: ic_launcher_round.png / ic_launcher_round.xml are NOT removed —
-  // the overlay provides electerm round icons (referenced by
-  // android:roundIcon in the manifest) that overwrite Capacitor's defaults
-  // during the copy above.  Removing them would delete our own icons.
-  const conflicts = [
-    'drawable-v24/ic_launcher_foreground.xml',
-    'values/ic_launcher_background.xml',
-    'drawable/splash.png'
-  ]
-  for (const rel of conflicts) {
-    const f = path.join(resDir, rel)
-    if (fs.existsSync(f)) {
-      fs.rmSync(f, { force: true })
-      console.log('[ios] removed conflicting resource:', rel)
-    }
-  }
+  // Insert NSAppTransportSecurity dict before the closing </dict> of the root.
+  // This allows the WebView to load http://127.0.0.1:5577 (the Node.js backend)
+  // and also permits NSAllowsLocalNetworking for broader localhost coverage.
+  const atsXml = `  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>127.0.0.1</key>
+      <dict>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key>
+        <true/>
+        <key>NSIncludesSubdomains</key>
+        <false/>
+      </dict>
+    </dict>
+  </dict>
+`
+  plist = plist.replace('</dict>\n</plist>', atsXml + '</dict>\n</plist>')
+  fs.writeFileSync(plistPath, plist)
+  console.log('[ios] wrote ATS exception to', plistPath)
 }
 
 // --------------------------------------------------------------------------
@@ -524,9 +503,9 @@ async function main () {
   writeNodeEntry()
   copyEnv()
 
-  // Apply icons after building www (no-op if native project doesn't exist yet).
-  // The `sync` and `android` npm scripts re-run `node build.mjs --overlay-only`
-  // after `cap sync` to restore the icons that cap sync resets.
+  // Patch Info.plist with ATS exception (no-op if native project doesn't exist yet).
+  // The `sync` and `ios` npm scripts re-run `node build.mjs --overlay-only`
+  // after `cap sync` to re-apply the ATS patch that cap sync resets.
   applyResOverlay()
 
   console.log('[ios] web + node project ready at', WWW)

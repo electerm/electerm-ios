@@ -113,12 +113,13 @@ dist
 /build/iTerm2-Color-Schemes
 /database
 /electerm_session_logs
-/src/electerm-react
 /test-results
 /data
-/src/client/electerm-react
 /data1
+# src/ is downloaded from electerm-android at install time (see build/bin/install.js)
+/src/
 .vscode
 .trae
 .workbuddy
 __pycache__
+.catpawai

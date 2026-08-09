@@ -60,20 +60,8 @@ jobs:
       - name: Sync Capacitor (copies web assets + native plugins)
         run: cd build/ios && npx cap sync ios
 
-      - name: Patch Info.plist (allow cleartext localhost to the Node backend)
-        run: |
-          PLIST=build/ios/ios/App/App/Info.plist
-          if [ -f "$PLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "$PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains dict" "$PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1 dict" "$PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1:NSExceptionAllowsInsecureHTTPLoads bool true" "$PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1:NSIncludesSubdomains bool false" "$PLIST" 2>/dev/null || true
-            echo "Info.plist patched for localhost ATS"
-          else
-            echo "WARN: Info.plist not found at $PLIST"
-          fi
+      - name: Apply Info.plist overlay (ATS exception for localhost)
+        run: cd build/ios && node build.mjs --overlay-only
 
       - name: Resolve Swift Package Manager dependencies
         run: |
