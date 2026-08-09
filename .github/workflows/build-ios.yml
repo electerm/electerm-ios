@@ -2,7 +2,7 @@ name: Build iOS App
 
 on:
   push:
-    branches: [ dev, main, build-ios ]
+    branches: [ main, build-ios ]
   workflow_dispatch:
 
 # GitHub Actions already skips workflows when the commit message contains

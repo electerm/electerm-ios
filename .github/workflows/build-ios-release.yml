@@ -222,7 +222,7 @@ jobs:
           ARCHIVE_PATH="$GITHUB_WORKSPACE/build/ios/output/electerm.xcarchive"
           EXPORT_DIR="$GITHUB_WORKSPACE/build/ios/output/ipa"
           PLIST_PATH="$GITHUB_WORKSPACE/build/ios/ExportOptions.plist"
-          BUNDLE_ID="org.electerm.electerm-ios"
+          BUNDLE_ID="org.electerm.electermios"
 
           mkdir -p "$EXPORT_DIR"
 
@@ -320,7 +320,7 @@ jobs:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
         run: |
           IPA_FILE="${{ env.ipa_path }}"
-          BUNDLE_ID="org.electerm.electerm-ios"
+          BUNDLE_ID="org.electerm.electermios"
 
           if [ -z "$IPA_FILE" ] || [ ! -f "$IPA_FILE" ]; then
             echo "❌ IPA file not found"
@@ -450,7 +450,7 @@ jobs:
           echo "- Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- Build number: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Bundle ID: org.electerm.electerm-ios" >> $GITHUB_STEP_SUMMARY
+          echo "- Bundle ID: org.electerm.electermios" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Artifacts:" >> $GITHUB_STEP_SUMMARY
           echo "- \`electerm-ios-ipa\` — signed IPA ready for App Store" >> $GITHUB_STEP_SUMMARY
