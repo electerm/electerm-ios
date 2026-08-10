@@ -193,21 +193,32 @@ jobs:
 
           rm -f /tmp/profile.mobileprovision
 
-      - name: Update build number
+      - name: Set version & build number from package.json
         env:
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          # Update CURRENT_PROJECT_VERSION (CFBundleVersion) to the GitHub
-          # Actions run number so each upload is unique (App Store Connect
-          # rejects duplicate build numbers).
+          # Read the marketing version (e.g. 5.0.7) from package.json and
+          # set MARKETING_VERSION (CFBundleShortVersionString) in the Xcode
+          # project. Also set CURRENT_PROJECT_VERSION (CFBundleVersion) to
+          # the GitHub Actions run number so each upload is unique (App Store
+          # Connect rejects duplicate build numbers).
           cd build/ios/ios/App
 
-          # Use sed to replace CURRENT_PROJECT_VERSION in the Release config
-          # The project file has CURRENT_PROJECT_VERSION = 1 in the Release section
-          sed -i '' 's/CURRENT_PROJECT_VERSION = 1;/CURRENT_PROJECT_VERSION = '"$BUILD_NUMBER"';/g' \
+          APP_VERSION=$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
+          echo "App version from package.json: $APP_VERSION"
+          echo "Build number (run number): $BUILD_NUMBER"
+
+          # Replace MARKETING_VERSION (the version shown in App Store Connect)
+          sed -i '' 's/MARKETING_VERSION = [^;]*;/MARKETING_VERSION = '"$APP_VERSION"';/g' \
             App.xcodeproj/project.pbxproj
 
+          # Replace CURRENT_PROJECT_VERSION (the build number)
+          sed -i '' 's/CURRENT_PROJECT_VERSION = [^;]*;/CURRENT_PROJECT_VERSION = '"$BUILD_NUMBER"';/g' \
+            App.xcodeproj/project.pbxproj
+
+          echo "✅ Updated MARKETING_VERSION to $APP_VERSION"
           echo "✅ Updated build number to $BUILD_NUMBER"
+          grep 'MARKETING_VERSION' App.xcodeproj/project.pbxproj
           grep 'CURRENT_PROJECT_VERSION' App.xcodeproj/project.pbxproj
 
       # ──────────────────────────────────────────────────────────────────────
