@@ -1,0 +1,549 @@
+# This workflow builds a signed iOS IPA and uploads it to App Store Connect.
+#
+# Required GitHub secrets (see docs/ios-ci-signing-guide.md for how to obtain them):
+#   IOS_CERTIFICATE_P12_BASE64        – iOS Distribution certificate (.p12), base64-encoded
+#   IOS_CERTIFICATE_PASSWORD          – password for the .p12 certificate
+#   IOS_PROVISIONING_PROFILE_BASE64   – App Store provisioning profile (.mobileprovision), base64-encoded
+#   APPLE_ID                          – Apple ID email address
+#   APPLE_APP_SPECIFIC_PASSWORD       – app-specific password for altool upload
+#   APPLE_TEAM_ID                     – Apple Developer Team ID (e.g. 38ZYC7L6N5)
+#   SERVER_SECRET                     – JWT secret for the on-device electerm server (optional, random if unset)
+#
+# Optional secrets:
+#   APP_STORE_CONNECT_API_KEY_P8      – App Store Connect API key (.p8), base64-encoded (alternative upload method)
+#   APP_STORE_CONNECT_ISSUER_ID       – App Store Connect API issuer ID
+#   APP_STORE_CONNECT_KEY_ID          – App Store Connect API key ID
+
+name: build-ios-release
+
+on:
+  push:
+    branches: [ release, release-ios, build-ios-release, dev ]
+  workflow_dispatch:
+
+jobs:
+  build-and-upload:
+    name: Build & Upload iOS to App Store Connect
+    runs-on: macos-latest
+    timeout-minutes: 120
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]') && !contains(github.event.head_commit.message, '[no ci]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Accept Xcode license
+        run: sudo xcodebuild -license accept || true
+
+      - name: Ensure CocoaPods is available
+        run: which pod >/dev/null 2>&1 || sudo gem install cocoapods
+
+      - name: ci init
+        run: npm config set legacy-peer-deps true
+
+      - name: Install root dependencies
+        run: npm i
+
+      - name: Install Capacitor dependencies
+        run: npm --prefix build/ios install
+
+      - name: Build web frontend + Node.js backend bundle
+        env:
+          SERVER_SECRET: ${{ secrets.SERVER_SECRET }}
+        run: npm run build:ios
+
+      - name: Bypass Capacitor appId validation (Apple allows dashes, Capacitor does not)
+        run: |
+          # Capacitor enforces Java package name rules (no dashes) even for
+          # iOS-only apps. Apple's bundle ID rules are more permissive and
+          # allow dashes. Patch checkAppId() to skip validation so `cap add ios`
+          # accepts org.electerm.electerm-ios.
+          node -e "
+            const fs = require('fs');
+            const p = 'build/ios/node_modules/@capacitor/cli/dist/common.js';
+            let c = fs.readFileSync(p, 'utf8');
+            c = c.replace(
+              /async function checkAppId\(config, id\) \{[\s\S]*?\nexports\.checkAppId = checkAppId;/,
+              'async function checkAppId(config, id) { return null; }\nexports.checkAppId = checkAppId;'
+            );
+            fs.writeFileSync(p, c);
+            console.log('Patched Capacitor appId validation');
+          "
+
+      - name: Add iOS platform (first run only)
+        run: cd build/ios && [ -d ios ] || npx cap add ios
+
+      - name: Sync Capacitor (copies web assets + native plugins)
+        run: cd build/ios && npx cap sync ios
+
+      - name: Apply Info.plist overlay (ATS exception for localhost)
+        run: cd build/ios && node build.mjs --overlay-only
+
+      - name: Resolve Swift Package Manager dependencies
+        run: |
+          cd build/ios/ios/App
+          xcodebuild -project App.xcodeproj -resolvePackageDependencies \
+            -configuration Release
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Code signing setup
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Create temporary keychain and import signing certificate
+        env:
+          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          KEYCHAIN="ios-build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          # Delete any leftover keychain with the same name
+          security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+
+          # Create a new temporary keychain and make it the default
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security set-keychain-settings -t 3600 -l "$KEYCHAIN"
+
+          # Unlock it so xcodebuild / codesign can access it later
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Import the .p12 distribution certificate + private key
+          if [ -z "$IOS_CERTIFICATE_P12_BASE64" ]; then
+            echo "❌ IOS_CERTIFICATE_P12_BASE64 secret is empty."
+            echo "Set it with:"
+            echo "  base64 -i your-cert.p12 | gh secret set IOS_CERTIFICATE_P12_BASE64 --body -"
+            exit 1
+          fi
+          echo "$IOS_CERTIFICATE_P12_BASE64" | base64 --decode > /tmp/cert.p12 2>/dev/null || {
+            echo "❌ Failed to decode IOS_CERTIFICATE_P12_BASE64 — not valid base64."
+            echo "The secret must contain the base64-encoded .p12 certificate CONTENTS,"
+            echo "not a file path. Re-set it with:"
+            echo "  base64 -i your-cert.p12 | gh secret set IOS_CERTIFICATE_P12_BASE64 --body -"
+            exit 1
+          }
+          if [ ! -s /tmp/cert.p12 ]; then
+            echo "❌ Decoded .p12 file is empty."
+            exit 1
+          fi
+          echo "✅ Certificate decoded ($(wc -c < /tmp/cert.p12) bytes)"
+          security import /tmp/cert.p12 \
+            -k "$KEYCHAIN" \
+            -P "$IOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/xcodebuild \
+            -T /usr/bin/security
+
+          # Allow codesign to read the key without prompting for permission
+          # (sets the partition list so the key is accessible by the tool)
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Verify the import
+          echo "✅ Certificates in keychain:"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          rm -f /tmp/cert.p12
+
+      - name: Install App Store provisioning profile
+        env:
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > /tmp/profile.mobileprovision
+
+          # Extract the UUID from the profile so we can name the file correctly
+          UUID=$(security cms -D -i /tmp/profile.mobileprovision 2>/dev/null \
+            | plutil -extract UUID raw - 2>/dev/null)
+
+          if [ -z "$UUID" ]; then
+            echo "❌ Could not extract UUID from provisioning profile"
+            echo "The profile may be invalid or corrupted."
+            exit 1
+          fi
+
+          echo "Provisioning profile UUID: $UUID"
+          cp /tmp/profile.mobileprovision "$PROFILES_DIR/$UUID.mobileprovision"
+          echo "provisioning-profile-uuid=$UUID" >> "$GITHUB_ENV"
+
+          # Also copy it to a well-known path for xcodebuild -exportArchive
+          cp /tmp/profile.mobileprovision "$PROFILES_DIR/electerm-ios.mobileprovision"
+
+          echo "✅ Installed provisioning profile:"
+          ls -la "$PROFILES_DIR/"
+
+          # Print profile details for debugging
+          echo ""
+          echo "Profile details:"
+          security cms -D -i "$PROFILES_DIR/$UUID.mobileprovision" 2>/dev/null \
+            | plutil -extract Name raw - 2>/dev/null && echo ""
+          security cms -D -i "$PROFILES_DIR/$UUID.mobileprovision" 2>/dev/null \
+            | plutil -extract TeamIdentifier.0 raw - 2>/dev/null && echo ""
+
+          rm -f /tmp/profile.mobileprovision
+
+      - name: Set version & build number from package.json
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          # Read the marketing version (e.g. 5.0.7) from package.json and
+          # set MARKETING_VERSION (CFBundleShortVersionString) in the Xcode
+          # project. Also set CURRENT_PROJECT_VERSION (CFBundleVersion) to
+          # the GitHub Actions run number so each upload is unique (App Store
+          # Connect rejects duplicate build numbers).
+          cd build/ios/ios/App
+
+          APP_VERSION=$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
+          echo "App version from package.json: $APP_VERSION"
+          echo "Build number (run number): $BUILD_NUMBER"
+
+          # Replace MARKETING_VERSION (the version shown in App Store Connect)
+          sed -i '' 's/MARKETING_VERSION = [^;]*;/MARKETING_VERSION = '"$APP_VERSION"';/g' \
+            App.xcodeproj/project.pbxproj
+
+          # Replace CURRENT_PROJECT_VERSION (the build number)
+          sed -i '' 's/CURRENT_PROJECT_VERSION = [^;]*;/CURRENT_PROJECT_VERSION = '"$BUILD_NUMBER"';/g' \
+            App.xcodeproj/project.pbxproj
+
+          echo "✅ Updated MARKETING_VERSION to $APP_VERSION"
+          echo "✅ Updated build number to $BUILD_NUMBER"
+          grep 'MARKETING_VERSION' App.xcodeproj/project.pbxproj
+          grep 'CURRENT_PROJECT_VERSION' App.xcodeproj/project.pbxproj
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Archive (produces .xcarchive)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Configure provisioning profile for App target only
+        env:
+          PP_UUID: ${{ env.provisioning-profile-uuid }}
+        run: |
+          # Set PROVISIONING_PROFILE_SPECIFIER only on the App target's Release
+          # build configuration inside project.pbxproj.  Passing it as a global
+          # xcodebuild override breaks SPM plugin targets (NodejsPlugin, etc.)
+          # which do not support provisioning profiles.
+          cd build/ios/ios/App
+          node -e "
+            const fs = require('fs');
+            const p = 'App.xcodeproj/project.pbxproj';
+            let c = fs.readFileSync(p, 'utf8');
+            const uuid = process.env.PP_UUID;
+            // Replace existing signing style/identity in the pbxproj so the
+            // App target uses Manual signing with our distribution identity.
+            c = c.replace(/CODE_SIGN_STYLE = Automatic;/g, 'CODE_SIGN_STYLE = Manual;');
+            c = c.replace(/CODE_SIGN_IDENTITY = \".*?\";/g, 'CODE_SIGN_IDENTITY = \"iPhone Distribution\";');
+            // Insert PROVISIONING_PROFILE settings after EVERY occurrence of the
+            // bundle ID marker (both Debug and Release configs).
+            const marker = 'PRODUCT_BUNDLE_IDENTIFIER = org.electerm.electerm-ios;';
+            const ppLine = 'PROVISIONING_PROFILE_SPECIFIER = \"' + uuid + '\";';
+            const ppUuidLine = 'PROVISIONING_PROFILE = \"' + uuid + '\";';
+            let count = 0;
+            let idx = c.indexOf(marker);
+            while (idx !== -1) {
+              const insert = '\n\t\t\t\t' + ppLine + '\n\t\t\t\t' + ppUuidLine;
+              c = c.slice(0, idx + marker.length) + insert + c.slice(idx + marker.length);
+              count++;
+              idx = c.indexOf(marker, idx + marker.length + insert.length);
+            }
+            if (count === 0) { console.error('Could not find PRODUCT_BUNDLE_IDENTIFIER in pbxproj'); process.exit(1); }
+            fs.writeFileSync(p, c);
+            console.log('✅ Patched ' + count + ' build config(s) with manual signing + provisioning profile');
+          "
+
+      - name: Archive iOS app (signed)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cd build/ios/ios/App
+
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/build/ios/output/electerm.xcarchive"
+          mkdir -p "$(dirname "$ARCHIVE_PATH")"
+
+          echo "Archiving App (Release, signed)..."
+          xcodebuild -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE="Manual" \
+            CODE_SIGN_IDENTITY="iPhone Distribution" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            archive \
+            2>&1 | tee /tmp/xcodebuild-archive.log
+
+          # Check if archive was created
+          if [ ! -d "$ARCHIVE_PATH" ]; then
+            echo "❌ Archive was not created at $ARCHIVE_PATH"
+            exit 1
+          fi
+
+          echo "✅ Archive created:"
+          du -sh "$ARCHIVE_PATH"
+          ls -la "$ARCHIVE_PATH/Products/Applications/"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Export IPA (from .xcarchive)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Generate ExportOptions.plist and export signed IPA
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/build/ios/output/electerm.xcarchive"
+          EXPORT_DIR="$GITHUB_WORKSPACE/build/ios/output/ipa"
+          PLIST_PATH="$GITHUB_WORKSPACE/build/ios/ExportOptions.plist"
+          BUNDLE_ID="org.electerm.electerm-ios"
+
+          mkdir -p "$EXPORT_DIR"
+
+          # Extract the provisioning profile name from the installed profile
+          # so ExportOptions.plist always matches, regardless of what the user
+          # named the profile when creating it.
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_FILE=$(find "$PROFILES_DIR" -name "electerm-ios.mobileprovision" | head -1)
+          if [ -z "$PROFILE_FILE" ]; then
+            # Fallback: find any .mobileprovision that matches our bundle ID
+            for f in "$PROFILES_DIR"/*.mobileprovision; do
+              NAME=$(security cms -D -i "$f" 2>/dev/null | plutil -extract Name raw - 2>/dev/null)
+              ENT_BUNDLE=$(security cms -D -i "$f" 2>/dev/null | plutil -extract Entitlements.application-identifier raw - 2>/dev/null)
+              if echo "$ENT_BUNDLE" | grep -q "$BUNDLE_ID"; then
+                PROFILE_FILE="$f"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$PROFILE_FILE" ]; then
+            echo "❌ Could not find a provisioning profile for $BUNDLE_ID"
+            exit 1
+          fi
+
+          PROFILE_NAME=$(security cms -D -i "$PROFILE_FILE" 2>/dev/null | plutil -extract Name raw - 2>/dev/null)
+          PROFILE_UUID=$(security cms -D -i "$PROFILE_FILE" 2>/dev/null | plutil -extract UUID raw - 2>/dev/null)
+
+          echo "Using provisioning profile:"
+          echo "  Name: $PROFILE_NAME"
+          echo "  UUID: $PROFILE_UUID"
+
+          # Generate ExportOptions.plist dynamically
+          cat > "$PLIST_PATH" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store</string>
+              <key>teamID</key>
+              <string>${APPLE_TEAM_ID}</string>
+              <key>uploadBitcode</key>
+              <false/>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>${BUNDLE_ID}</key>
+                  <string>${PROFILE_NAME}</string>
+              </dict>
+              <key>stripSwiftSymbols</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          echo "ExportOptions.plist:"
+          cat "$PLIST_PATH"
+
+          echo ""
+          echo "Exporting IPA from archive..."
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$PLIST_PATH" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            2>&1 | tee /tmp/xcodebuild-export.log
+
+          # Find the IPA
+          IPA_FILE=$(find "$EXPORT_DIR" -name "*.ipa" -type f | head -1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "❌ No IPA file was created in $EXPORT_DIR"
+            echo "Contents of export dir:"
+            ls -laR "$EXPORT_DIR"
+            exit 1
+          fi
+
+          echo "✅ IPA created: $IPA_FILE"
+          echo "Size: $(du -h "$IPA_FILE" | cut -f1)"
+          echo "ipa_path=$IPA_FILE" >> "$GITHUB_ENV"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Upload to App Store Connect
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Upload IPA to App Store Connect
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+        run: |
+          IPA_FILE="${{ env.ipa_path }}"
+          BUNDLE_ID="org.electerm.electerm-ios"
+
+          if [ -z "$IPA_FILE" ] || [ ! -f "$IPA_FILE" ]; then
+            echo "❌ IPA file not found"
+            exit 1
+          fi
+
+          echo "Uploading to App Store Connect..."
+          echo "  IPA:  $IPA_FILE"
+          echo "  Size: $(du -h "$IPA_FILE" | cut -f1)"
+          echo "  Bundle ID: $BUNDLE_ID"
+          echo ""
+
+          # Prefer App Store Connect API key authentication if available
+          # (more reliable than app-specific password, and doesn't expire)
+          if [ -n "$APP_STORE_CONNECT_API_KEY_P8" ] && \
+             [ -n "$APP_STORE_CONNECT_ISSUER_ID" ] && \
+             [ -n "$APP_STORE_CONNECT_KEY_ID" ]; then
+
+            echo "Using App Store Connect API key authentication..."
+            API_KEY_DIR="$HOME/.appstoreconnect/private_keys"
+            mkdir -p "$API_KEY_DIR"
+            echo "$APP_STORE_CONNECT_API_KEY_P8" | base64 --decode \
+              > "$API_KEY_DIR/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+
+            xcrun altool --upload-app \
+              --type ios \
+              --file "$IPA_FILE" \
+              --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+              --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
+              --verbose || {
+              echo ""
+              echo "❌ Upload failed (API key method)"
+              echo ""
+              echo "Common reasons:"
+              echo "  • App with bundle ID '$BUNDLE_ID' doesn't exist in App Store Connect"
+              echo "  • API key lacks App Manager or Admin role"
+              echo "  • Build number already exists in App Store Connect"
+              echo ""
+              echo "Solutions:"
+              echo "  1. Create app in App Store Connect: https://appstoreconnect.apple.com/apps"
+              echo "  2. Verify bundle ID matches exactly: $BUNDLE_ID"
+              echo "  3. Check the API key has 'App Manager' or 'Admin' role"
+              echo "  4. Increment the build number (each upload must be unique)"
+              echo ""
+              exit 1
+            }
+
+          else
+
+            echo "Using app-specific password authentication..."
+            xcrun altool --upload-app \
+              --type ios \
+              --file "$IPA_FILE" \
+              --username "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --primary-bundle-id "$BUNDLE_ID" \
+              --verbose || {
+              echo ""
+              echo "❌ Upload failed (app-specific password method)"
+              echo ""
+              echo "Common reasons:"
+              echo "  • App with bundle ID '$BUNDLE_ID' doesn't exist in App Store Connect"
+              echo "  • Apple ID doesn't have access to this app"
+              echo "  • App-specific password is incorrect or expired"
+              echo "  • Build number already exists in App Store Connect"
+              echo ""
+              echo "Solutions:"
+              echo "  1. Create app in App Store Connect: https://appstoreconnect.apple.com/apps"
+              echo "  2. Verify bundle ID matches exactly: $BUNDLE_ID"
+              echo "  3. Check Apple ID has App Manager or Admin role"
+              echo "  4. Regenerate app-specific password: https://appleid.apple.com"
+              echo "  5. Increment the build number (each upload must be unique)"
+              echo ""
+              echo "Alternative: Download IPA artifact and upload via Transporter.app GUI"
+              echo ""
+              exit 1
+            }
+
+          fi
+
+          echo ""
+          echo "✅ Upload to App Store Connect complete!"
+          echo ""
+          echo "Next steps:"
+          echo "1. Go to https://appstoreconnect.apple.com"
+          echo "2. Select your app"
+          echo "3. Wait for Apple's automated processing (usually 5-30 minutes)"
+          echo "4. Add release notes / screenshots"
+          echo "5. Submit for review"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Cleanup keychain (always run, even on failure)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Cleanup temporary keychain
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "ios-build.keychain-db" 2>/dev/null || true
+          echo "Keychain cleaned up"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Upload IPA as artifact (so you can download and inspect / manually upload)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Upload signed IPA artifact
+        if: ${{ !cancelled() && env.ipa_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: electerm-ios-ipa
+          path: ${{ env.ipa_path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload xcarchive artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: electerm-ios-xcarchive
+          path: build/ios/output/electerm.xcarchive
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          echo "## iOS Build & Upload Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Information:" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build number: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Bundle ID: org.electerm.electerm-ios" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`electerm-ios-ipa\` — signed IPA ready for App Store" >> $GITHUB_STEP_SUMMARY
+          echo "- \`electerm-ios-xcarchive\` — Xcode archive (for debugging symbol extraction)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### App Store Connect:" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ env.ipa_path }}" ]; then
+            echo "✅ IPA uploaded to App Store Connect" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Visit https://appstoreconnect.apple.com to complete submission." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Upload may have failed — check the logs above." >> $GITHUB_STEP_SUMMARY
+          fi
