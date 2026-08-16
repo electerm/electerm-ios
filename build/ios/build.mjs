@@ -16,8 +16,9 @@
  *      font-list) are kept *external*: the source loads them via guarded
  *      `import()` calls that fall back gracefully, so a missing module never
  *      prevents the server from starting. Logging uses a built-in dependency-free
- *      logger (no `electron-log`), and `node:sqlite` is replaced by a sql.js-backed
- *      shim (the on-device runtime is Node 18, which has no built-in `node:sqlite`).
+ *      logger (no `electron-log`). The on-device runtime is jitless Node 18
+ *      (no WebAssembly), so the db layer uses the pure-JS nedb backend and
+ *      `node:sqlite` is aliased to a throwing stub.
  */
 import { build as viteBuild } from 'vite'
 import * as esbuild from 'esbuild'
@@ -185,79 +186,27 @@ function writeLoadingPage () {
 }
 
 // --------------------------------------------------------------------------
-// 3. Backend (esbuild) with native stubs + node:sqlite shim
+// 3. Backend (esbuild) with native stubs + node:sqlite stub
 // --------------------------------------------------------------------------
-async function genSqliteShim () {
-  // sql.js exposes `./dist/*` through its "exports", so resolve the wasm
-  // directly (its package.json subpath is intentionally not exported).
-  const wasmPath = require.resolve('sql.js/dist/sql-wasm.wasm')
-  const wasm = fs.readFileSync(wasmPath)
-  const b64 = wasm.toString('base64')
-
-  // Synchronous `DatabaseSync` shim backed by sql.js (pure JS + WASM).
-  // Module-level `await initSqlJs(...)` guarantees SQL is ready before any
-  // `new DatabaseSync(...)` / `stmt.all()` is executed.
-  const shim = `import initSqlJs from 'sql.js'
-import fs from 'node:fs'
-import { Buffer } from 'node:buffer'
-
-const wasmBinary = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0))
-const SQL = await initSqlJs({ wasmBinary })
-
-export class DatabaseSync {
-  constructor (path) {
-    this.path = path
-    const buf = fs.existsSync(path) ? fs.readFileSync(path) : undefined
-    this.db = new SQL.Database(buf)
-  }
-  exec (sql) {
-    this.db.run(sql)
-    this._persist()
-  }
-  prepare (sql) {
-    return new Stmt(this.db, sql, this)
-  }
-  _persist () {
-    try { fs.writeFileSync(this.path, Buffer.from(this.db.export())) } catch (e) {}
-  }
-}
-
-class Stmt {
-  constructor (db, sql, owner) {
-    this.s = db.prepare(sql)
-    this.owner = owner
-  }
-  all () {
-    const out = []
-    while (this.s.step()) out.push(this.s.getAsObject())
-    this.s.free()
-    return out
-  }
-  get (...params) {
-    if (params.length) this.s.bind(params)
-    const r = this.s.step() ? this.s.getAsObject() : undefined
-    this.s.free()
-    return r
-  }
-  run (...params) {
-    if (params.length) this.s.bind(params)
-    this.s.step()
-    const ch = this._changes()
-    this.s.free()
-    this.owner._persist()
-    return { changes: ch }
-  }
-  _changes () {
-    const res = this.owner.db.exec('SELECT changes()')
-    return res && res[0] && res[0].values && res[0].values[0] ? res[0].values[0][0] : 0
+// The on-device Node runtime is jitless: `WebAssembly` is not defined, so the
+// old sql.js-backed shim could never initialize (its module init threw an
+// unhandled rejection and the whole db layer silently failed to load). The
+// backend now uses the pure-JS nedb wrapper (src/app/lib/nedb.js) selected by
+// DISABLE_SQLITE=1 in the generated entry. `node:sqlite` is still aliased so
+// esbuild never tries to resolve it (Node 18 has no builtin), but the stub
+// only throws if something imports it directly.
+function genSqliteStub () {
+  const stub = `export class DatabaseSync {
+  constructor () {
+    throw new Error('node:sqlite is not available on this platform (jitless runtime, no WebAssembly); the nedb backend is used instead')
   }
 }
 `
   const genDir = path.resolve(__dirname, '.gen')
   fs.mkdirSync(genDir, { recursive: true })
-  const shimPath = path.resolve(genDir, 'node-sqlite-shim.mjs')
-  fs.writeFileSync(shimPath, shim)
-  return shimPath
+  const stubPath = path.resolve(genDir, 'node-sqlite-stub.mjs')
+  fs.writeFileSync(stubPath, stub)
+  return stubPath
 }
 
 // esbuild plugin: rewrite path-to-regexp v8 Unicode property-escape regexes
@@ -319,8 +268,11 @@ async function bundleBackend (shimPath) {
     target: 'node18',
     outfile: path.resolve(NODEJS_DIR, 'app.bundle.mjs'),
     alias: {
-      // The on-device runtime is Node 18, which has no built-in `node:sqlite`.
-      // Replace it with the sql.js-backed synchronous shim produced above.
+      // The on-device runtime is Node 18, which has no built-in `node:sqlite`,
+      // and it is jitless (no WebAssembly) so a sql.js shim cannot work either.
+      // The backend's db.js selects the pure-JS nedb backend via DISABLE_SQLITE;
+      // this alias only exists so esbuild can resolve the bare `node:sqlite`
+      // import in sqlite.js (which is never loaded on-device).
       'node:sqlite': shimPath
     },
     // Native modules that are not built for iOS yet. Keep them external so
@@ -358,7 +310,8 @@ function copyEnv () {
 
 function writeNodeEntry () {
   const entry = `import { resolve } from 'node:path'
-import { mkdirSync } from 'node:fs'
+import fs, { mkdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const __d = fileURLToPath(new URL('.', import.meta.url))
@@ -381,26 +334,63 @@ process.env.PORT = '5577'
 process.env.SERVER_SECRET = ${JSON.stringify(SERVER_SECRET)}
 // No real pty on iOS -> disable the local terminal feature.
 process.env.DISABLE_LOCAL_TERMINAL = '1'
+// The on-device Node.js engine runs jitless (no WebAssembly), so the
+// sql.js-backed sqlite shim cannot load. Tell db.js to use the pure-JS
+// nedb backend and view.js that nedb files are the primary store (no
+// "migrate nedb -> sqlite" banner).
+process.env.DISABLE_SQLITE = '1'
 // Tell the server where the pug views live (cwd is now the node project dir,
 // set above via process.chdir(__d)).
 process.env.VIEW_FOLDER = resolve(__d, 'views')
 
 // Stable, app-private user-data directory.
-// The Node.js project is extracted by @capawesome/capacitor-nodejs into the
-// app's internal storage. If we keep user data inside that extracted project
-// it can be wiped when the bundled node project is refreshed on an app
-// update. Putting it in a sibling directory keeps the database, uploads and
-// logs safe across updates.
+//
+// On iOS the bundled Node.js project lives INSIDE the app bundle
+// (App.app/public/nodejs), which is READ-ONLY on a real device. Any attempt
+// to mkdir inside it throws EACCES, the Node engine exits, and the app
+// closes immediately after launch (the simulator never showed this because
+// simulator bundles are writable). So the data dir must live outside the
+// bundle.
+//
+// The plugin's native layer registers the app's Documents directory for us
+// (NodeRunner.registerDataDirPath), exposed to Node via
+// process._linkedBinding('capacitor_bridge').getDataDir(). That directory:
+//   - is writable on real devices
+//   - survives app updates (unlike anything inside the bundle)
+//
+// Fallbacks (desktop runs of the same bundle, older plugin builds):
+//   1. <Documents>/electerm-data  (when the linked binding is unavailable)
+//   2. <project>/data             (writable when not running from a bundle)
 const userDataDir = (() => {
+  const candidates = []
   try {
-    const dir = resolve(__d, '..', 'electerm-data')
-    mkdirSync(dir, { recursive: true })
-    return dir
-  } catch (e) {
-    const fallback = resolve(__d, 'data')
-    mkdirSync(fallback, { recursive: true })
-    return fallback
+    // Preferred: the data dir registered by the native plugin (Documents dir).
+    const bridge = process._linkedBinding('capacitor_bridge')
+    const registered = bridge.getDataDir()
+    if (registered) candidates.push(resolve(registered, 'electerm-data'))
+  } catch (e) {}
+  // Inside the app bundle -> parent dir is still read-only, skip it entirely.
+  if (!__d.includes('.app/')) {
+    candidates.push(resolve(__d, '..', 'electerm-data'))
+    candidates.push(resolve(__d, 'data'))
   }
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true })
+      // Verify it is actually writable — mkdir on a read-only FS may not
+      // throw on all platforms, and writing the DB later would crash the app.
+      const probe = resolve(dir, '.write-test')
+      fs.writeFileSync(probe, '')
+      fs.rmSync(probe)
+      return dir
+    } catch (e) {}
+  }
+  // Last resort: system temp dir (always writable; data won't persist across
+  // reinstalls but the app starts, and the real dirs above virtually always
+  // succeed).
+  const tmp = resolve(tmpdir(), 'electerm-data')
+  mkdirSync(tmp, { recursive: true })
+  return tmp
 })()
 process.env.DB_PATH = userDataDir
 
@@ -515,6 +505,30 @@ function applyResOverlay () {
 
 // --------------------------------------------------------------------------
 // --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// 4a. src overrides (build/replace -> src)
+// --------------------------------------------------------------------------
+// src/ is downloaded from electerm-android at install time (build/bin/install.js)
+// and is git-ignored — it must never be edited directly. iOS-specific backend
+// overrides live in build/replace/ mirroring the src/ tree; this step copies
+// them over src/ before bundling, so the bundle sees the patched sources while
+// the repo keeps a clean, reviewable set of overrides.
+function applySrcOverrides () {
+  const replaceSrc = path.resolve(__dirname, '..', 'replace', 'src')
+  if (!fs.existsSync(replaceSrc)) {
+    return
+  }
+  const srcRoot = path.resolve(ROOT, 'src')
+  fs.cpSync(replaceSrc, srcRoot, {
+    recursive: true,
+    // never copy the replace tree's own metadata files
+    filter: (src) => !src.endsWith('.DS_Store')
+  })
+  console.log('[ios] applied src overrides from', path.dirname(replaceSrc))
+}
+
+// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 async function main () {
   // --overlay-only: just re-apply the res-overlay after `cap sync` without
   // rebuilding the entire www bundle. Used by the `sync` npm script.
@@ -526,11 +540,12 @@ async function main () {
   fs.rmSync(WWW, { recursive: true, force: true })
   fs.mkdirSync(NODEJS_DIR, { recursive: true })
 
+  applySrcOverrides()
   await runVite()
   copyFrontendAssets()
   writeLoadingPage()
 
-  const shimPath = await genSqliteShim()
+  const shimPath = genSqliteStub()
   await bundleBackend(shimPath)
   writeNodeEntry()
   copyEnv()
