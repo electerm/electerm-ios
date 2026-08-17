@@ -52,7 +52,8 @@ const base = {
   disableUpgradeCheck: true,
   hideLocalTerminal: true,
   AIDisclamer: 'AI generated content is for reference only',
-  mandatoryGuardrails: ''
+  mandatoryGuardrails: '',
+  enableAIFlag: true
 }
 
 async function handleIndex (req, res) {

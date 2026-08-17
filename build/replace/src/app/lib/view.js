@@ -81,7 +81,8 @@ export async function index (req, res) {
     disableUpgradeCheck: true,
     hideLocalTerminal: true,
     AIDisclamer: 'AI generated content is for reference only',
-    mandatoryGuardrails
+    mandatoryGuardrails,
+    enableAIFlag: true
   }
   const {
     ENABLE_AUTH
