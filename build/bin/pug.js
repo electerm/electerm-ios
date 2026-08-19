@@ -39,6 +39,7 @@ const data = {
   isDev: false,
   cdn: '',
   tokenElecterm: '',
+  enableAIFlag: true,
   defaultAIPreset
 }
 const htmlContent = pug.render(pugContent, {

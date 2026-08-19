@@ -18,10 +18,6 @@ import proxy from 'express-http-proxy'
 import fsFunctions from '../../src/app/common/fs-functions.js'
 import { createToken } from '../../src/app/lib/jwt.js'
 import { logDir } from '../../src/app/server/session-log.js'
-import { resolve } from 'path'
-import fs from 'fs'
-import { defaultUserName } from '../../src/app/common/runtime-constants.js'
-import { migrationNotice } from '../../src/app/lib/fancy-console.js'
 
 const devPort = env.DEV_PORT || 5570
 const devHost = env.DEV_HOST || '127.0.0.1'
@@ -52,53 +48,19 @@ const base = {
   cdn: h,
   isWebApp: true,
   sessionLogPath: logDir,
-  tokenElecterm: process.env.ENABLE_AUTH ? '' : createToken()
-}
-let needMigrate
-function checkNeedMigrate () {
-  if (needMigrate !== undefined) {
-    return needMigrate
-  }
-
-  const nedbPath = process.env.DB_PATH || resolve(cwd, 'data/nedb-database')
-  const nedbUserPath = resolve(nedbPath, 'users', defaultUserName)
-
-  // Check if nedb directory exists and has .nedb files
-  if (fs.existsSync(nedbUserPath)) {
-    const nedbFiles = fs.readdirSync(nedbUserPath).filter(file => file.endsWith('.nedb'))
-
-    if (nedbFiles.length > 0) {
-      needMigrate = true
-      return needMigrate
-    }
-  }
-
-  needMigrate = false
-  return needMigrate
-}
-
-async function checkNodePty () {
-  return import('node-pty')
-    .then(() => true)
-    .catch(() => false)
+  tokenElecterm: process.env.ENABLE_AUTH ? '' : createToken(),
+  disableUpgradeCheck: true,
+  hideLocalTerminal: true,
+  AIDisclamer: 'AI generated content is for reference only',
+  mandatoryGuardrails: '',
+  enableAIFlag: true
 }
 
 async function handleIndex (req, res) {
-  const hasNodePty = await checkNodePty()
-  const needMigrate = checkNeedMigrate()
-  if (needMigrate) {
-    migrationNotice(
-      'electerm-web v3',
-      'nedb',
-      'sqlite',
-      'electerm-data-tool --data-path "/path/to/data/nedb-database" export data.json'
-    )
-  }
   const data = {
     ...base,
     query: req.query,
-    hasNodePty,
-    needMigrate
+    hasNodePty: false
   }
   const view = 'index'
   res.render(view, {

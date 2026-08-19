@@ -16,8 +16,9 @@
  *      font-list) are kept *external*: the source loads them via guarded
  *      `import()` calls that fall back gracefully, so a missing module never
  *      prevents the server from starting. Logging uses a built-in dependency-free
- *      logger (no `electron-log`), and `node:sqlite` is replaced by a sql.js-backed
- *      shim (the on-device runtime is Node 18, which has no built-in `node:sqlite`).
+ *      logger (no `electron-log`). The on-device runtime is jitless Node 18
+ *      (no WebAssembly), so the db layer uses the pure-JS nedb backend and
+ *      `node:sqlite` is aliased to a throwing stub.
  */
 import { build as viteBuild } from 'vite'
 import * as esbuild from 'esbuild'
@@ -185,79 +186,27 @@ function writeLoadingPage () {
 }
 
 // --------------------------------------------------------------------------
-// 3. Backend (esbuild) with native stubs + node:sqlite shim
+// 3. Backend (esbuild) with native stubs + node:sqlite stub
 // --------------------------------------------------------------------------
-async function genSqliteShim () {
-  // sql.js exposes `./dist/*` through its "exports", so resolve the wasm
-  // directly (its package.json subpath is intentionally not exported).
-  const wasmPath = require.resolve('sql.js/dist/sql-wasm.wasm')
-  const wasm = fs.readFileSync(wasmPath)
-  const b64 = wasm.toString('base64')
-
-  // Synchronous `DatabaseSync` shim backed by sql.js (pure JS + WASM).
-  // Module-level `await initSqlJs(...)` guarantees SQL is ready before any
-  // `new DatabaseSync(...)` / `stmt.all()` is executed.
-  const shim = `import initSqlJs from 'sql.js'
-import fs from 'node:fs'
-import { Buffer } from 'node:buffer'
-
-const wasmBinary = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0))
-const SQL = await initSqlJs({ wasmBinary })
-
-export class DatabaseSync {
-  constructor (path) {
-    this.path = path
-    const buf = fs.existsSync(path) ? fs.readFileSync(path) : undefined
-    this.db = new SQL.Database(buf)
-  }
-  exec (sql) {
-    this.db.run(sql)
-    this._persist()
-  }
-  prepare (sql) {
-    return new Stmt(this.db, sql, this)
-  }
-  _persist () {
-    try { fs.writeFileSync(this.path, Buffer.from(this.db.export())) } catch (e) {}
-  }
-}
-
-class Stmt {
-  constructor (db, sql, owner) {
-    this.s = db.prepare(sql)
-    this.owner = owner
-  }
-  all () {
-    const out = []
-    while (this.s.step()) out.push(this.s.getAsObject())
-    this.s.free()
-    return out
-  }
-  get (...params) {
-    if (params.length) this.s.bind(params)
-    const r = this.s.step() ? this.s.getAsObject() : undefined
-    this.s.free()
-    return r
-  }
-  run (...params) {
-    if (params.length) this.s.bind(params)
-    this.s.step()
-    const ch = this._changes()
-    this.s.free()
-    this.owner._persist()
-    return { changes: ch }
-  }
-  _changes () {
-    const res = this.owner.db.exec('SELECT changes()')
-    return res && res[0] && res[0].values && res[0].values[0] ? res[0].values[0][0] : 0
+// The on-device Node runtime is jitless: `WebAssembly` is not defined, so the
+// old sql.js-backed shim could never initialize (its module init threw an
+// unhandled rejection and the whole db layer silently failed to load). The
+// backend now uses the pure-JS nedb wrapper (src/app/lib/nedb.js) selected by
+// DISABLE_SQLITE=1 in the generated entry. `node:sqlite` is still aliased so
+// esbuild never tries to resolve it (Node 18 has no builtin), but the stub
+// only throws if something imports it directly.
+function genSqliteStub () {
+  const stub = `export class DatabaseSync {
+  constructor () {
+    throw new Error('node:sqlite is not available on this platform (jitless runtime, no WebAssembly); the nedb backend is used instead')
   }
 }
 `
   const genDir = path.resolve(__dirname, '.gen')
   fs.mkdirSync(genDir, { recursive: true })
-  const shimPath = path.resolve(genDir, 'node-sqlite-shim.mjs')
-  fs.writeFileSync(shimPath, shim)
-  return shimPath
+  const stubPath = path.resolve(genDir, 'node-sqlite-stub.mjs')
+  fs.writeFileSync(stubPath, stub)
+  return stubPath
 }
 
 // esbuild plugin: rewrite path-to-regexp v8 Unicode property-escape regexes
@@ -319,8 +268,11 @@ async function bundleBackend (shimPath) {
     target: 'node18',
     outfile: path.resolve(NODEJS_DIR, 'app.bundle.mjs'),
     alias: {
-      // The on-device runtime is Node 18, which has no built-in `node:sqlite`.
-      // Replace it with the sql.js-backed synchronous shim produced above.
+      // The on-device runtime is Node 18, which has no built-in `node:sqlite`,
+      // and it is jitless (no WebAssembly) so a sql.js shim cannot work either.
+      // The backend's db.js selects the pure-JS nedb backend via DISABLE_SQLITE;
+      // this alias only exists so esbuild can resolve the bare `node:sqlite`
+      // import in sqlite.js (which is never loaded on-device).
       'node:sqlite': shimPath
     },
     // Native modules that are not built for iOS yet. Keep them external so
@@ -358,7 +310,8 @@ function copyEnv () {
 
 function writeNodeEntry () {
   const entry = `import { resolve } from 'node:path'
-import { mkdirSync } from 'node:fs'
+import fs, { mkdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const __d = fileURLToPath(new URL('.', import.meta.url))
@@ -381,26 +334,71 @@ process.env.PORT = '5577'
 process.env.SERVER_SECRET = ${JSON.stringify(SERVER_SECRET)}
 // No real pty on iOS -> disable the local terminal feature.
 process.env.DISABLE_LOCAL_TERMINAL = '1'
+// The on-device Node.js engine runs jitless (no WebAssembly), so the
+// sql.js-backed sqlite shim cannot load. Tell db.js to use the pure-JS
+// nedb backend and view.js that nedb files are the primary store (no
+// "migrate nedb -> sqlite" banner).
+process.env.DISABLE_SQLITE = '1'
 // Tell the server where the pug views live (cwd is now the node project dir,
 // set above via process.chdir(__d)).
 process.env.VIEW_FOLDER = resolve(__d, 'views')
 
+// The embedded engine is Node 18, where net.connect's autoSelectFamily
+// defaults to false: a hostname with an AAAA record gets a single IPv6
+// connect attempt, and on networks with no usable IPv6 route the SSH
+// connection fails with EHOSTUNREACH ("no route to host") with no IPv4
+// retry. Prefer A records so the common IPv4 path is tried first.
+import dns from 'node:dns'
+dns.setDefaultResultOrder('ipv4first')
+
 // Stable, app-private user-data directory.
-// The Node.js project is extracted by @capawesome/capacitor-nodejs into the
-// app's internal storage. If we keep user data inside that extracted project
-// it can be wiped when the bundled node project is refreshed on an app
-// update. Putting it in a sibling directory keeps the database, uploads and
-// logs safe across updates.
+//
+// On iOS the bundled Node.js project lives INSIDE the app bundle
+// (App.app/public/nodejs), which is READ-ONLY on a real device. Any attempt
+// to mkdir inside it throws EACCES, the Node engine exits, and the app
+// closes immediately after launch (the simulator never showed this because
+// simulator bundles are writable). So the data dir must live outside the
+// bundle.
+//
+// The plugin's native layer registers the app's Documents directory for us
+// (NodeRunner.registerDataDirPath), exposed to Node via
+// process._linkedBinding('capacitor_bridge').getDataDir(). That directory:
+//   - is writable on real devices
+//   - survives app updates (unlike anything inside the bundle)
+//
+// Fallbacks (desktop runs of the same bundle, older plugin builds):
+//   1. <Documents>/electerm-data  (when the linked binding is unavailable)
+//   2. <project>/data             (writable when not running from a bundle)
 const userDataDir = (() => {
+  const candidates = []
   try {
-    const dir = resolve(__d, '..', 'electerm-data')
-    mkdirSync(dir, { recursive: true })
-    return dir
-  } catch (e) {
-    const fallback = resolve(__d, 'data')
-    mkdirSync(fallback, { recursive: true })
-    return fallback
+    // Preferred: the data dir registered by the native plugin (Documents dir).
+    const bridge = process._linkedBinding('capacitor_bridge')
+    const registered = bridge.getDataDir()
+    if (registered) candidates.push(resolve(registered, 'electerm-data'))
+  } catch (e) {}
+  // Inside the app bundle -> parent dir is still read-only, skip it entirely.
+  if (!__d.includes('.app/')) {
+    candidates.push(resolve(__d, '..', 'electerm-data'))
+    candidates.push(resolve(__d, 'data'))
   }
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true })
+      // Verify it is actually writable — mkdir on a read-only FS may not
+      // throw on all platforms, and writing the DB later would crash the app.
+      const probe = resolve(dir, '.write-test')
+      fs.writeFileSync(probe, '')
+      fs.rmSync(probe)
+      return dir
+    } catch (e) {}
+  }
+  // Last resort: system temp dir (always writable; data won't persist across
+  // reinstalls but the app starts, and the real dirs above virtually always
+  // succeed).
+  const tmp = resolve(tmpdir(), 'electerm-data')
+  mkdirSync(tmp, { recursive: true })
+  return tmp
 })()
 process.env.DB_PATH = userDataDir
 
@@ -441,6 +439,39 @@ await import('./app.bundle.mjs')
 //
 // This function is a no-op when the native project has not been created yet
 // (e.g. during a pure `npm run build:ios` before `cap add ios`).
+
+// The web UI is not safe-area aware (no viewport-fit=cover / env() usage),
+// so on devices with a notch / Dynamic Island the fixed-position header
+// slides under the system status bar. Instead of restyling the web app,
+// keep the WKWebView itself inside the safe area: a container VC embeds
+// Capacitor's CAPBridgeViewController with safe-area constraints. The web
+// content then lays out inside the safe rect and env(safe-area-inset-*)
+// would even resolve to 0 — nothing in the web layer needs to change.
+const safeAreaContainerSwift = `import UIKit
+import Capacitor
+
+/// Container that keeps the Capacitor web view below the status bar /
+/// Dynamic Island and above the home indicator, without requiring the
+/// web content itself to be safe-area aware.
+class SafeAreaContainerViewController: UIViewController {
+  private let bridge = CAPBridgeViewController()
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    addChild(bridge)
+    view.addSubview(bridge.view)
+    bridge.view.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      bridge.view.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      bridge.view.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+      bridge.view.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
+      bridge.view.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor)
+    ])
+    bridge.didMove(toParent: self)
+  }
+}
+`
+
 function applyResOverlay () {
   const plistPath = path.resolve(__dirname, 'ios', 'App', 'App', 'Info.plist')
   if (!fs.existsSync(plistPath)) {
@@ -479,6 +510,36 @@ function applyResOverlay () {
     console.log('[ios] NSAppTransportSecurity already present, skipping ATS patch')
   }
 
+  // ── Local Network privacy (iOS 14+) ─────────────────────────────────
+  // Without NSLocalNetworkUsageDescription iOS never shows the Local
+  // Network permission prompt and silently drops connections to LAN
+  // hosts (192.168.x, 10.x, .local…) — the SSH layer then reports
+  // EHOSTUNREACH / "no route to host". The simulator does not enforce
+  // this, so it only reproduces on real devices. electerm connects to
+  // arbitrary user-configured hosts, so we must declare the usage.
+  // NSBonjourServices is required iff the app browses Bonjour; listed
+  // for the protocols electerm supports over .local hostnames.
+  if (!plist.includes('NSLocalNetworkUsageDescription')) {
+    console.log('[ios] patching Info.plist NSLocalNetworkUsageDescription…')
+    const localNetXml = `  <key>NSLocalNetworkUsageDescription</key>
+  <string>electerm needs local network access to connect to SSH/SFTP/telnet/RDP/VNC/Spice/FTP hosts on your network.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_ssh._tcp</string>
+    <string>_sftp-ssh._tcp</string>
+    <string>_telnet._tcp</string>
+    <string>_ftp._tcp</string>
+    <string>_rfb._tcp</string>
+    <string>_rdp._tcp</string>
+  </array>
+`
+    plist = plist.replace('</dict>\n</plist>', localNetXml + '</dict>\n</plist>')
+    fs.writeFileSync(plistPath, plist)
+    console.log('[ios] wrote local network keys to', plistPath)
+  } else {
+    console.log('[ios] NSLocalNetworkUsageDescription already present, skipping')
+  }
+
   // ── Set MARKETING_VERSION from package.json ──────────────────────────
   // The Xcode project's MARKETING_VERSION defaults to 1.0. We overwrite it
   // with the version from package.json so App Store Connect shows the
@@ -511,6 +572,110 @@ function applyResOverlay () {
   } else {
     console.log('[ios] app icon source or destination not found, skipping icon copy')
   }
+
+  // ── Safe-area container for the web view ─────────────────────────────
+  // Adds SafeAreaContainerViewController.swift to the app target and makes
+  // it the storyboard's initial VC (instead of CAPBridgeViewController).
+  // The app's web UI is laid out for the full screen and its fixed header
+  // ends up under the status bar / Dynamic Island; embedding the bridge
+  // inside a safe-area-constrained container fixes this natively, with no
+  // web-layer changes.
+  const swiftPath = path.resolve(__dirname, 'ios', 'App', 'App', 'SafeAreaContainerViewController.swift')
+  if (!fs.existsSync(swiftPath)) {
+    fs.writeFileSync(swiftPath, safeAreaContainerSwift)
+    console.log('[ios] wrote SafeAreaContainerViewController.swift')
+  } else {
+    fs.writeFileSync(swiftPath, safeAreaContainerSwift)
+    console.log('[ios] refreshed SafeAreaContainerViewController.swift')
+  }
+  const storyboardPath = path.resolve(__dirname, 'ios', 'App', 'App', 'Base.lproj', 'Main.storyboard')
+  if (fs.existsSync(storyboardPath)) {
+    let storyboard = fs.readFileSync(storyboardPath, 'utf8')
+    // The template tag is customClass="CAPBridgeViewController" customModule="Capacitor".
+    // Replace the class AND flip the module (our VC lives in the app target),
+    // handling both orderings and the module being present or absent.
+    const capRe = /customClass="CAPBridgeViewController"(?:\s+customModule="[^"]*")?/
+    if (capRe.test(storyboard)) {
+      storyboard = storyboard.replace(
+        capRe,
+        'customClass="SafeAreaContainerViewController" customModule="App"'
+      )
+      fs.writeFileSync(storyboardPath, storyboard)
+      console.log('[ios] storyboard initial VC -> SafeAreaContainerViewController')
+    } else if (storyboard.includes('customClass="SafeAreaContainerViewController"')) {
+      // self-heal: strip any stray duplicate customModule left by an older
+      // patch run (e.g. customModule="App" customModule="Capacitor")
+      const healed = storyboard.replace(
+        /(customClass="SafeAreaContainerViewController" customModule="App")(\s+customModule="[^"]*")?/,
+        '$1'
+      )
+      if (healed !== storyboard) {
+        fs.writeFileSync(storyboardPath, healed)
+        console.log('[ios] healed duplicate customModule in storyboard')
+      } else {
+        console.log('[ios] storyboard already uses SafeAreaContainerViewController')
+      }
+    } else {
+      console.warn('[ios] WARNING: could not find CAPBridgeViewController in Main.storyboard — safe-area patch skipped')
+    }
+  }
+
+  // ── Register SafeAreaContainerViewController.swift in the Xcode project ──
+  // The project uses explicit file lists (not synchronized folders), so the
+  // new Swift file must be added in 4 places in project.pbxproj: as a build
+  // file, a file reference, a group child, and in the Sources build phase.
+  // IDs are 24-hex-char strings; these are chosen to be unique in this file.
+  if (fs.existsSync(pbxprojPath)) {
+    let pbxproj = fs.readFileSync(pbxprojPath, 'utf8')
+    if (!pbxproj.includes('SafeAreaContainerViewController.swift')) {
+      const buildFileId = '5A1E000000000001000000A1'
+      const fileRefId = '5A1E000000000002000000A2'
+      pbxproj = pbxproj.replace(
+        '/* Begin PBXBuildFile section */\n',
+        `/* Begin PBXBuildFile section */\n\t\t${buildFileId} /* SafeAreaContainerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${fileRefId} /* SafeAreaContainerViewController.swift */; };\n`
+      )
+      pbxproj = pbxproj.replace(
+        '/* Begin PBXFileReference section */\n',
+        `/* Begin PBXFileReference section */\n\t\t${fileRefId} /* SafeAreaContainerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeAreaContainerViewController.swift; sourceTree = "<group>"; };\n`
+      )
+      pbxproj = pbxproj.replace(
+        /\t\t\t\t504EC3071FED79650016851F \/\* AppDelegate\.swift \*\/,\n/,
+        '\t\t\t\t504EC3071FED79650016851F /* AppDelegate.swift */,\n\t\t\t\t' + fileRefId + ' /* SafeAreaContainerViewController.swift */,\n'
+      )
+      pbxproj = pbxproj.replace(
+        /\t\t\t\t504EC3081FED79650016851F \/\* AppDelegate\.swift in Sources \*\/,\n/,
+        '\t\t\t\t504EC3081FED79650016851F /* AppDelegate.swift in Sources */,\n\t\t\t\t' + buildFileId + ' /* SafeAreaContainerViewController.swift in Sources */,\n'
+      )
+      fs.writeFileSync(pbxprojPath, pbxproj)
+      console.log('[ios] registered SafeAreaContainerViewController.swift in Xcode project')
+    } else {
+      console.log('[ios] SafeAreaContainerViewController.swift already registered')
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// 4a. src overrides (build/replace -> src)
+// --------------------------------------------------------------------------
+// src/ is downloaded from electerm-android at install time (build/bin/install.js)
+// and is git-ignored — it must never be edited directly. iOS-specific backend
+// overrides live in build/replace/ mirroring the src/ tree; this step copies
+// them over src/ before bundling, so the bundle sees the patched sources while
+// the repo keeps a clean, reviewable set of overrides.
+function applySrcOverrides () {
+  const replaceSrc = path.resolve(__dirname, '..', 'replace', 'src')
+  if (!fs.existsSync(replaceSrc)) {
+    return
+  }
+  const srcRoot = path.resolve(ROOT, 'src')
+  fs.cpSync(replaceSrc, srcRoot, {
+    recursive: true,
+    // never copy the replace tree's own metadata files
+    filter: (src) => !src.endsWith('.DS_Store')
+  })
+  console.log('[ios] applied src overrides from', path.dirname(replaceSrc))
 }
 
 // --------------------------------------------------------------------------
@@ -526,11 +691,12 @@ async function main () {
   fs.rmSync(WWW, { recursive: true, force: true })
   fs.mkdirSync(NODEJS_DIR, { recursive: true })
 
+  applySrcOverrides()
   await runVite()
   copyFrontendAssets()
   writeLoadingPage()
 
-  const shimPath = await genSqliteShim()
+  const shimPath = genSqliteStub()
   await bundleBackend(shimPath)
   writeNodeEntry()
   copyEnv()
