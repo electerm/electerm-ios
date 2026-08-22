@@ -123,3 +123,5 @@ dist
 .workbuddy
 __pycache__
 .catpawai
+build/ios/DerivedData
+/output
