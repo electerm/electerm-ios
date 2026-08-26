@@ -14,6 +14,8 @@ Open-sourced ssh/sftp/telnet/RDP/VNC/Spice/ftp client for iOS, built on top of t
 [electerm-web](https://github.com/electerm/electerm-web) codebase with
 [Capacitor](https://capacitorjs.com/) and an on-device Node.js runtime.
 
+Download on the [Apple App Store](https://apps.apple.com/cn/app/electerm/id6792971552).
+
 > **Note on local terminal & serial port:** electerm for iOS currently does
 > **not** support the local terminal or serial port. These features rely on
 > native libraries (`node-pty`, `serialport`) that can not be built for iOS
