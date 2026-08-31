@@ -26,6 +26,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { applySrcOverrides } from '../bin/apply-src-overrides.mjs'
 
 const require = createRequire(import.meta.url)
 const __filename = fileURLToPath(import.meta.url)
@@ -666,6 +667,11 @@ async function main () {
 
   fs.rmSync(WWW, { recursive: true, force: true })
   fs.mkdirSync(NODEJS_DIR, { recursive: true })
+
+  // Apply iOS-specific src overrides (build/replace/src -> src/) BEFORE vite/esbuild
+  // so the bundle sees the patched sources. Idempotent; also called by the npm
+  // install lifecycle (build/bin/install.js) so CI and local builds stay identical.
+  applySrcOverrides()
 
   await runVite()
   copyFrontendAssets()
