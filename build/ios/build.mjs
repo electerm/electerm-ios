@@ -656,30 +656,6 @@ function applyResOverlay () {
 
 // --------------------------------------------------------------------------
 // --------------------------------------------------------------------------
-// --------------------------------------------------------------------------
-// 4a. src overrides (build/replace -> src)
-// --------------------------------------------------------------------------
-// src/ is downloaded from electerm-android at install time (build/bin/install.js)
-// and is git-ignored — it must never be edited directly. iOS-specific backend
-// overrides live in build/replace/ mirroring the src/ tree; this step copies
-// them over src/ before bundling, so the bundle sees the patched sources while
-// the repo keeps a clean, reviewable set of overrides.
-function applySrcOverrides () {
-  const replaceSrc = path.resolve(__dirname, '..', 'replace', 'src')
-  if (!fs.existsSync(replaceSrc)) {
-    return
-  }
-  const srcRoot = path.resolve(ROOT, 'src')
-  fs.cpSync(replaceSrc, srcRoot, {
-    recursive: true,
-    // never copy the replace tree's own metadata files
-    filter: (src) => !src.endsWith('.DS_Store')
-  })
-  console.log('[ios] applied src overrides from', path.dirname(replaceSrc))
-}
-
-// --------------------------------------------------------------------------
-// --------------------------------------------------------------------------
 async function main () {
   // --overlay-only: just re-apply the res-overlay after `cap sync` without
   // rebuilding the entire www bundle. Used by the `sync` npm script.
@@ -691,7 +667,6 @@ async function main () {
   fs.rmSync(WWW, { recursive: true, force: true })
   fs.mkdirSync(NODEJS_DIR, { recursive: true })
 
-  applySrcOverrides()
   await runVite()
   copyFrontendAssets()
   writeLoadingPage()

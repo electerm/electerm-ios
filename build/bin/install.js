@@ -10,9 +10,10 @@
  * build scripts and iOS-specific build configuration.
  *
  * After the source sync we also copy the @electerm/electerm-react client
- * from node_modules (same as the original install step).
+ * from node_modules (same as the original install step), then apply the
+ * iOS-specific src overrides from build/replace/src on top of src/.
  */
-import { writeFile, mkdir } from 'node:fs/promises'
+import { writeFile, mkdir, cp as cpAsync } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import pkg from 'shelljs'
@@ -25,6 +26,7 @@ const BRANCH = 'main'
 const URL = `https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}`
 const TMP = resolve('temp/electerm-android-src')
 const TMP_FILE = resolve(TMP, 'electerm-android.tar.gz')
+const REPLACE_SRC = resolve('build/replace/src')
 
 echo('install required modules')
 
@@ -80,7 +82,20 @@ shellRm('-rf', 'src/client/electerm-react')
 cp('-r', 'node_modules/@electerm/electerm-react/client', 'src/client/electerm-react')
 
 // ---------------------------------------------------------------------------
-// 4. Cleanup temp files
+// 4. Apply iOS-specific src overrides from build/replace/src (mirrors the
+//    src/ tree; keeps the downloaded electerm-android source untouched in
+//    git while patching it on disk for the iOS build).
+// ---------------------------------------------------------------------------
+if (existsSync(REPLACE_SRC)) {
+  echo('applying src overrides from build/replace/src')
+  await cpAsync(REPLACE_SRC, resolve('src'), {
+    recursive: true,
+    filter: (src) => !src.endsWith('.DS_Store')
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 5. Cleanup temp files
 // ---------------------------------------------------------------------------
 shellRm('-rf', TMP)
 

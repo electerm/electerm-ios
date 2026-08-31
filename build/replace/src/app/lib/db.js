@@ -7,7 +7,7 @@
  * throws and the promise rejects — fall back to the pure-JS nedb wrapper,
  * which needs no WASM and persists to DB_PATH.
  *
- * This file lives in build/replace/ and is copied over src/ at iOS build
+ * This file lives in build/replace/ and is copied over src/ at install
  * time (src/ is downloaded from electerm-android and must not be edited).
  */
 
