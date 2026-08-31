@@ -27,14 +27,14 @@ const mandatoryGuardrails = [
   '6. If a request violates these policies, decline politely, state the reason in one sentence, and offer a safe alternative when possible. Do not lecture beyond that.'
 ].join('\n')
 
-// const defaultAIPreset = {
-//   baseURLAI: 'https://ai.electerm.org/api/ai',
-//   apiPathAI: '/chat/completions',
-//   modelAI: 'mistral-small-latest',
-//   authHeaderNameAI: 'Authorization: Bearer',
-//   id: 'ai.electerm.org',
-//   nameAI: 'ai.electerm.org(default free)'
-// }
+const defaultAIPreset = {
+  baseURLAI: 'https://ai.electerm.org/api/ai',
+  apiPathAI: '/chat/completions',
+  modelAI: 'mistral-small-latest',
+  authHeaderNameAI: 'Authorization: Bearer',
+  id: 'ai.electerm.org',
+  nameAI: 'ai.electerm.org'
+}
 
 function buildServer () {
   return `http://${process.env.HOST}:${process.env.PORT}`
@@ -82,7 +82,8 @@ export async function index (req, res) {
     AIDisclamer: 'AI generated content is for reference only',
     mandatoryGuardrails,
     enableAIFlag: true,
-    syncTypes: ['github', 'custom', 'webdav'],
+    defaultAIPreset,
+    syncTypes: ['github', 'gitee', 'cloud', 'custom', 'webdav'],
     AITermOfUse: `About the AI feature / AI 功能说明
 
 When you use the AI feature, your input (such as text, commands, terminal output, or other data you send to the model) is transmitted to the third-party LLM provider you configure. That provider may collect, store, and use it according to their own privacy policy. electerm does not control, and is not responsible for, how third-party LLM providers handle your data.
