@@ -52,7 +52,6 @@ export async function index (req, res) {
   const supportSessionTypes = [
     'ssh',
     'telnet',
-    'web',
     'rdp',
     'vnc',
     'ftp',
