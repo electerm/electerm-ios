@@ -33,6 +33,13 @@ const defaultAIPreset = {
   id: 'ai.electerm.org',
   nameAI: 'ai.electerm.org(default free)'
 }
+const sysMenu = [
+  'onNewSsh',
+  'openSetting',
+  'openAbout',
+  'zoom',
+  'reload'
+]
 const base = {
   version: pack.version,
   isDev: !isProd,
@@ -53,7 +60,8 @@ const base = {
   hideLocalTerminal: true,
   AIDisclamer: 'AI generated content is for reference only',
   mandatoryGuardrails: '',
-  enableAIFlag: true
+  enableAIFlag: true,
+  sysMenu
 }
 
 async function handleIndex (req, res) {

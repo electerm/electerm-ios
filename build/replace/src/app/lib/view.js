@@ -57,6 +57,13 @@ export async function index (req, res) {
     'ftp',
     'spice'
   ]
+  const sysMenus = [
+    'onNewSsh',
+    'openSetting',
+    'openAbout',
+    'zoom',
+    'reload'
+  ]
   const data = {
     isDev,
     isMac,
@@ -77,6 +84,7 @@ export async function index (req, res) {
     hasNodePty,
     supportSessionTypes,
     disableUpgradeCheck: true,
+    sysMenus,
     hideLocalTerminal: true,
     AIDisclamer: 'AI generated content is for reference only',
     mandatoryGuardrails,

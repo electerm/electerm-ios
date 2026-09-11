@@ -48,6 +48,7 @@ function createDb (appPath, defaultUserName, { enc, dec } = {}) {
     'lastStates',
     'data',
     'quickCommands',
+    'triggers',
     'log',
     'dbUpgradeLog',
     'profiles',
