@@ -6,6 +6,10 @@ import '../web-components/style-overide.styl'
 import '../electerm-react/css/mobile.styl'
 import '../web-components/web-api.js'
 import '../web-components/web-pre.js'
+// iOS WKWebView never fires `contextmenu` on long-press, so antd
+// trigger=['contextMenu'] menus (sftp list, tabs, ...) would never open.
+// The module self-installs a press-and-hold polyfill; no-op off iOS.
+import '../web-components/ios-longpress-menu.js'
 import { get as _get } from 'lodash-es'
 
 // iOS WKWebView has no requestIdleCallback. bookmark-form's save path wraps

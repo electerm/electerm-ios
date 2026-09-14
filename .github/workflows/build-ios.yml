@@ -81,6 +81,46 @@ jobs:
       - name: Apply Info.plist overlay (ATS exception for localhost)
         run: cd build/ios && node build.mjs --overlay-only
 
+      - name: Verify file-sharer plugin is registered
+        # @capgo/capacitor-file-sharer is the secondary (non-bridge) download
+        # path in build/replace/src/client/web-components/native-file-save.js.
+        # If `cap sync` doesn't register it (missing dep, sync failure) that
+        # fallback is gone. `cap sync` writes the npm package name into
+        # capacitor.plugins.json, so match on the package name
+        # (case-insensitive).
+        run: |
+          PLUGINS_JSON=$(find build/ios/ios -name 'capacitor.plugins.json' | head -1)
+          if [ -z "$PLUGINS_JSON" ]; then
+            echo "::error::capacitor.plugins.json not found under build/ios/ios"
+            exit 1
+          fi
+          grep -qi 'capacitor-file-sharer' "$PLUGINS_JSON" || {
+            echo "::error::@capgo/capacitor-file-sharer NOT registered in $PLUGINS_JSON"
+            cat "$PLUGINS_JSON"
+            exit 1
+          }
+          echo "file-sharer plugin registered OK ($PLUGINS_JSON)"
+
+      - name: Verify native download bridge is wired
+        # The UI page is served by the in-app Node.js server on
+        # http://127.0.0.1:5577 — NOT by Capacitor's own origin — so Capacitor
+        # never injects PluginHeaders there and every Capacitor plugin silently
+        # degrades to its web implementation (a no-op inside the WebView).
+        # "Download to Files" therefore goes through our own WKWebView
+        # message-handler bridge instead. If the overlay copy above ever
+        # silently stops landing these files, the build still succeeds but
+        # downloads are broken with no error, so assert they are in place.
+        run: |
+          SWIFT=build/ios/ios/App/App/ElectermSaveBridge.swift
+          CONTAINER=build/ios/ios/App/App/SafeAreaContainerViewController.swift
+          fail=0
+          [ -f "$SWIFT" ] || {
+            echo "::error::ElectermSaveBridge.swift missing at $SWIFT"; fail=1; }
+          grep -q 'ElectermNative' "$CONTAINER" || {
+            echo "::error::$CONTAINER does not install the ElectermNative bridge"; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+          echo "native download bridge wired OK"
+
       - name: Resolve Swift Package Manager dependencies
         run: |
           # Capacitor 8 uses SPM (not CocoaPods): the native project is an

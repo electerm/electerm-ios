@@ -450,6 +450,7 @@ await import('./app.bundle.mjs')
 // would even resolve to 0 — nothing in the web layer needs to change.
 const safeAreaContainerSwift = `import UIKit
 import Capacitor
+import WebKit
 
 /// Container that keeps the Capacitor web view below the status bar /
 /// Dynamic Island and above the home indicator, without requiring the
@@ -469,6 +470,319 @@ class SafeAreaContainerViewController: UIViewController {
       bridge.view.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor)
     ])
     bridge.didMove(toParent: self)
+    installSaveBridge()
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    // Re-attach: idempotent, and guarantees the bridge is present even if
+    // the WebView was recreated while we were backgrounded.
+    installSaveBridge()
+  }
+
+  /// Attach the native save bridge to Capacitor's WKWebView. The UI page is
+  /// served by the on-device Node backend (http://127.0.0.1:5577), outside
+  /// Capacitor's own origin, so Capacitor never injects its plugin runtime
+  /// there and the browser download path cannot work. See ElectermSaveBridge.
+  private func installSaveBridge() {
+    view.layoutIfNeeded()
+    guard let webView = findWebView(in: bridge.view) else { return }
+    ElectermSaveBridge.install(on: webView)
+  }
+
+  private func findWebView(in view: UIView) -> WKWebView? {
+    if let webView = view as? WKWebView { return webView }
+    for subview in view.subviews {
+      if let found = findWebView(in: subview) { return found }
+    }
+    return nil
+  }
+}
+`
+
+// ElectermSaveBridge.swift is written verbatim into the generated Xcode
+// project by applyResOverlay() below (the ios/ tree is gitignored and
+// rebuilt by `cap add ios` in CI, so checked-in native sources would never
+// reach the build). Keep this template in sync with the protocol expected by
+// build/replace/src/client/web-components/native-file-save.js:
+//   window.ElectermNative.getVersion() -> "1"
+//   saveUrl(url, token, fallbackName, callbackId)
+//   saveBase64(filename, base64Data, contentType, callbackId)
+// Results are reported via window.__etNativeSaveResult(callbackId, ok,
+// dataJson, errorString). Files land in the app's Documents directory, which
+// is visible in the iOS Files app.
+const electermSaveBridgeSwift = `import Foundation
+import WebKit
+
+/// electerm native save bridge (WKWebView -> Documents, visible in Files).
+///
+/// Why this exists
+/// ---------------
+/// The electerm UI is served by the on-device Node.js backend on
+/// http://127.0.0.1:5577, which is *not* the Capacitor local-server origin.
+/// Capacitor only injects its JS runtime (window.Capacitor + PluginHeaders)
+/// into documents of its own origin, so on the real UI page every Capacitor
+/// plugin call silently degrades to its "web" fallback — a blob/anchor
+/// download — and \`<a download>\` is a no-op inside WKWebView. Result:
+/// "download from browser" saved nothing.
+///
+/// What it does
+/// ------------
+/// Injects \`window.ElectermNative\` (WKUserScript, document start) backed
+/// by a WKScriptMessageHandler:
+///   saveUrl(url, token, fallbackName, callbackId)
+///     Fetches the /api/download response (token header included) and writes
+///     it to Documents. Streamed to disk via URLSession download task, so big
+///     files and directory tarballs never pass through JS memory.
+///   saveBase64(filename, base64Data, contentType, callbackId)
+///     Writes in-memory content (theme/quick-command/config exports).
+///
+/// Note: the bridge object is reachable from every document loaded in this
+/// WebView. The WebView only ever loads the packaged loading page and the
+/// loopback backend (see capacitor.config.ts allowNavigation), so no third
+/// party page can reach it.
+class ElectermSaveBridge: NSObject, WKScriptMessageHandler {
+
+  /// Version marker: lets the web app feature-detect this bridge.
+  static let version = "1"
+  static let handlerName = "ElectermNative"
+
+  private weak var webView: WKWebView?
+  private let worker = DispatchQueue(label: "org.electerm.savebridge", qos: .utility)
+
+  private static let shimScript: String = """
+    (function () {
+      if (window.ElectermNative && typeof window.ElectermNative.getVersion === 'function') return;
+      var handler = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ElectermNative) || null;
+      if (!handler) return;
+      window.ElectermNative = {
+        getVersion: function () { return "1"; },
+        saveUrl: function (url, token, fallbackName, callbackId) {
+          handler.postMessage({ method: 'saveUrl', url: url, token: token, fallbackName: fallbackName, callbackId: callbackId });
+        },
+        saveBase64: function (filename, base64Data, contentType, callbackId) {
+          handler.postMessage({ method: 'saveBase64', filename: filename, base64Data: base64Data, contentType: contentType, callbackId: callbackId });
+        }
+      };
+    })();
+    """
+
+  /// Attach the bridge to a WKWebView. Safe to call repeatedly: the message
+  /// handler is re-registered and the shim script is added once.
+  static func install(on webView: WKWebView) {
+    let controllers = webView.configuration.userContentController
+    controllers.removeScriptMessageHandler(forName: handlerName)
+    let bridge = ElectermSaveBridge(webView: webView)
+    controllers.add(bridge, name: handlerName)
+    let alreadyInjected = controllers.userScripts.contains { $0.source == shimScript }
+    if (!alreadyInjected) {
+      let script = WKUserScript(source: shimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+      controllers.addUserScript(script)
+    }
+  }
+
+  private init(webView: WKWebView) {
+    self.webView = webView
+  }
+
+  // MARK: - WKScriptMessageHandler
+
+  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard message.name == Self.handlerName,
+          let body = message.body as? [String: Any],
+          let method = body["method"] as? String,
+          let callbackId = body["callbackId"] as? String else { return }
+    worker.async { [weak self] in
+      guard let self = self else { return }
+      do {
+        let result: [String: String]
+        if (method == "saveUrl") {
+          result = try self.handleSaveUrl(body: body)
+        } else if (method == "saveBase64") {
+          result = try self.handleSaveBase64(body: body)
+        } else {
+          throw BridgeError.message("unknown method: " + method)
+        }
+        self.report(callbackId: callbackId, ok: true, data: result, error: nil)
+      } catch {
+        self.report(callbackId: callbackId, ok: false, data: nil, error: error.localizedDescription)
+      }
+    }
+  }
+
+  // MARK: - handlers
+
+  private func handleSaveUrl(body: [String: Any]) throws -> [String: String] {
+    guard let urlString = body["url"] as? String, let url = URL(string: urlString) else {
+      throw BridgeError.message("invalid url")
+    }
+    let token = body["token"] as? String ?? ""
+    let fallback = sanitize(body["fallbackName"] as? String ?? "download")
+
+    var request = URLRequest(url: url, timeoutInterval: 120)
+    request.httpMethod = "GET"
+    if (!token.isEmpty) {
+      request.setValue(token, forHTTPHeaderField: "token")
+    }
+    let (tempURL, response) = try perform(request: request)
+    defer { try? FileManager.default.removeItem(at: tempURL) }
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      throw BridgeError.message("server responded " + String((response as? HTTPURLResponse)?.statusCode ?? -1))
+    }
+    let headers = http.allHeaderFields
+    var headerMap: [String: String] = [:]
+    for (key, value) in headers {
+      if let k = key as? String, let v = value as? String {
+        headerMap[k.lowercased()] = v
+      }
+    }
+    let disposition = headerMap["content-disposition"]
+    let contentType = headerMap["content-type"]
+    var name = resolveFilename(disposition: disposition, fallback: fallback)
+    // The backend tars directories but only signals it via headers.
+    if (isGzip(contentType) && !name.lowercased().hasSuffix(".tar.gz")) {
+      name += ".tar.gz"
+    }
+    let data = try Data(contentsOf: tempURL)
+    return try saveToDocuments(name: name, data: data)
+  }
+
+  private func handleSaveBase64(body: [String: Any]) throws -> [String: String] {
+    let filename = sanitize(body["filename"] as? String ?? "download")
+    let raw = stripDataUrl(body["base64Data"] as? String ?? "")
+    guard let data = Data(base64Encoded: raw, options: .ignoreUnknownCharacters) else {
+      throw BridgeError.message("invalid base64 content")
+    }
+    return try saveToDocuments(name: filename, data: data)
+  }
+
+  private func perform(request: URLRequest) throws -> (URL, URLResponse) {
+    var resultURL: URL?
+    var resultResponse: URLResponse?
+    var resultError: Error?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.downloadTask(with: request) { url, response, error in
+      resultURL = url
+      resultResponse = response
+      resultError = error
+      semaphore.signal()
+    }.resume()
+    semaphore.wait()
+    if let error = resultError { throw error }
+    guard let url = resultURL, let response = resultResponse else {
+      throw BridgeError.message("empty response")
+    }
+    return (url, response)
+  }
+
+  private func saveToDocuments(name: String, data: Data) throws -> [String: String] {
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    let fileURL = uniqueFile(in: docs, name: name)
+    try data.write(to: fileURL, options: .atomic)
+    return ["name": fileURL.lastPathComponent, "location": fileURL.path]
+  }
+
+  private func uniqueFile(in dir: URL, name: String) -> URL {
+    let candidate = dir.appendingPathComponent(name)
+    if (!FileManager.default.fileExists(atPath: candidate.path)) { return candidate }
+    let ext = (name as NSString).pathExtension
+    let base = (name as NSString).deletingPathExtension
+    for i in 1..<1000 {
+      let next = ext.isEmpty ? base + " (" + String(i) + ")" : base + " (" + String(i) + ")." + ext
+      let url = dir.appendingPathComponent(next)
+      if (!FileManager.default.fileExists(atPath: url.path)) { return url }
+    }
+    return candidate
+  }
+
+  private func report(callbackId: String, ok: Bool, data: [String: String]?, error: String?) {
+    var dataJson: String? = nil
+    if let data = data,
+       let jsonData = try? JSONSerialization.data(withJSONObject: data),
+       let json = String(data: jsonData, encoding: .utf8) {
+      dataJson = json
+    }
+    let script = "window.__etNativeSaveResult("
+      + jsQuote(callbackId) + ","
+      + (ok ? "true" : "false") + ","
+      + (dataJson == nil ? "null" : jsQuote(dataJson!)) + ","
+      + (error == nil ? "null" : jsQuote(error!))
+      + ");"
+    DispatchQueue.main.async { [weak self] in
+      // WebView gone (view dismissed) - nothing to report to.
+      _ = self?.webView
+      self?.webView?.evaluateJavaScript(script, completionHandler: nil)
+    }
+  }
+
+  private func jsQuote(_ value: String) -> String {
+    if let data = try? JSONEncoder().encode(value),
+       let quoted = String(data: data, encoding: .utf8) {
+      return quoted
+    }
+    return "\\"" + value.replacingOccurrences(of: "\\\\", with: "\\\\\\\\").replacingOccurrences(of: "\\"", with: "\\\\\\"") + "\\""
+  }
+
+  // MARK: - filename helpers (mirror the Android bridge)
+
+  private func resolveFilename(disposition: String?, fallback: String) -> String {
+    var name: String? = nil
+    if let disposition = disposition {
+      if let range = disposition.range(of: "filename\\\\*\\\\s*=\\\\s*UTF-8''([^;]+)", options: [.regularExpression, .caseInsensitive]) {
+        var raw = String(disposition[range])
+        if let eq = raw.range(of: "''") { raw = String(raw[eq.upperBound...]) }
+        name = raw.replacingOccurrences(of: "\\"", with: "").trimmingCharacters(in: .whitespaces).removingPercentEncoding ?? raw
+      }
+      if (name == nil || name!.isEmpty) {
+        // RFC 6266: the plain form is a literal, already-decoded name.
+        if let match = disposition.range(of: "filename\\\\s*=\\\\s*\\"([^\\"]+)\\"", options: [.regularExpression, .caseInsensitive]) {
+          let raw = String(disposition[match])
+          if let q1 = raw.firstIndex(of: "\\""), let q2 = raw.lastIndex(of: "\\""), q1 != q2 {
+            name = String(raw[raw.index(after: q1)..<q2])
+          }
+        } else if let match = disposition.range(of: "filename\\\\s*=\\\\s*([^;]+)", options: [.regularExpression, .caseInsensitive]) {
+          var raw = String(disposition[match])
+          if let eq = raw.firstIndex(of: "=") { raw = String(raw[raw.index(after: eq)...]) }
+          name = raw.trimmingCharacters(in: .whitespaces)
+        }
+      }
+    }
+    if (name == nil || name!.isEmpty) { name = fallback }
+    return sanitize(name)
+  }
+
+  private func sanitize(_ name: String?) -> String {
+    guard var clean = name, !clean.isEmpty else { return "download" }
+    clean = clean.replacingOccurrences(of: "\\\\", with: "/")
+    if let slash = clean.lastIndex(of: "/") { clean = String(clean[clean.index(after: slash)...]) }
+    let invalid = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "*?<>|:\\u{22}"))
+    clean = clean.components(separatedBy: invalid).joined(separator: "_").trimmingCharacters(in: .whitespaces)
+    if (clean.isEmpty || clean == "." || clean == "..") { return "download" }
+    return clean
+  }
+
+  private func isGzip(_ contentType: String?) -> Bool {
+    return contentType?.lowercased().contains("gzip") ?? false
+  }
+
+  private func stripDataUrl(_ value: String) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let comma = trimmed.firstIndex(of: ",") {
+      let prefix = String(trimmed[..<comma]).lowercased()
+      if (prefix.contains("base64")) {
+        return String(trimmed[trimmed.index(after: comma)...]).components(separatedBy: .whitespacesAndNewlines).joined()
+      }
+    }
+    return trimmed.components(separatedBy: .whitespacesAndNewlines).joined()
+  }
+
+  private enum BridgeError: LocalizedError {
+    case message(String)
+    var errorDescription: String? {
+      switch self {
+      case .message(let text): return text
+      }
+    }
   }
 }
 `
@@ -539,6 +853,26 @@ function applyResOverlay () {
     console.log('[ios] wrote local network keys to', plistPath)
   } else {
     console.log('[ios] NSLocalNetworkUsageDescription already present, skipping')
+  }
+
+  // ── Expose Documents in the Files app ──────────────────────────────
+  // The native save bridge (ElectermSaveBridge.swift) writes downloads to
+  // the app's Documents directory, but iOS hides that folder from the Files
+  // app unless both keys below are set — without them a download succeeds
+  // (toast + file on disk) yet is nowhere to be found. With them the files
+  // appear under Files > On My iPhone > electerm.
+  if (!plist.includes('UIFileSharingEnabled')) {
+    console.log('[ios] patching Info.plist Files app visibility…')
+    const filesXml = `  <key>UIFileSharingEnabled</key>
+  <true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key>
+  <true/>
+`
+    plist = plist.replace('</dict>\n</plist>', filesXml + '</dict>\n</plist>')
+    fs.writeFileSync(plistPath, plist)
+    console.log('[ios] wrote Files app keys to', plistPath)
+  } else {
+    console.log('[ios] UIFileSharingEnabled already present, skipping')
   }
 
   // ── Set MARKETING_VERSION from package.json ──────────────────────────
@@ -621,37 +955,51 @@ function applyResOverlay () {
     }
   }
 
+  // ── Native save bridge (WKWebView -> Documents) ──────────────────────
+  // Writes ElectermSaveBridge.swift into the app target. The UI page is
+  // served by the on-device Node backend (http://127.0.0.1:5577), outside
+  // Capacitor's own origin, so Capacitor never injects its plugin runtime
+  // there and the browser download path cannot work. The bridge exposes
+  // window.ElectermNative (same protocol as Android's ElectermSaveBridge)
+  // so downloads land in Documents (visible in the Files app). See
+  // build/replace/src/client/web-components/native-file-save.js.
+  const saveBridgePath = path.resolve(__dirname, 'ios', 'App', 'App', 'ElectermSaveBridge.swift')
+  fs.writeFileSync(saveBridgePath, electermSaveBridgeSwift)
+  console.log('[ios] refreshed ElectermSaveBridge.swift')
+
   // ── Register SafeAreaContainerViewController.swift in the Xcode project ──
   // The project uses explicit file lists (not synchronized folders), so the
   // new Swift file must be added in 4 places in project.pbxproj: as a build
   // file, a file reference, a group child, and in the Sources build phase.
   // IDs are 24-hex-char strings; these are chosen to be unique in this file.
-  if (fs.existsSync(pbxprojPath)) {
+  function ensureSwiftFileRegistered (fileName, buildFileId, fileRefId) {
     let pbxproj = fs.readFileSync(pbxprojPath, 'utf8')
-    if (!pbxproj.includes('SafeAreaContainerViewController.swift')) {
-      const buildFileId = '5A1E000000000001000000A1'
-      const fileRefId = '5A1E000000000002000000A2'
-      pbxproj = pbxproj.replace(
-        '/* Begin PBXBuildFile section */\n',
-        `/* Begin PBXBuildFile section */\n\t\t${buildFileId} /* SafeAreaContainerViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = ${fileRefId} /* SafeAreaContainerViewController.swift */; };\n`
-      )
-      pbxproj = pbxproj.replace(
-        '/* Begin PBXFileReference section */\n',
-        `/* Begin PBXFileReference section */\n\t\t${fileRefId} /* SafeAreaContainerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeAreaContainerViewController.swift; sourceTree = "<group>"; };\n`
-      )
-      pbxproj = pbxproj.replace(
-        /\t\t\t\t504EC3071FED79650016851F \/\* AppDelegate\.swift \*\/,\n/,
-        '\t\t\t\t504EC3071FED79650016851F /* AppDelegate.swift */,\n\t\t\t\t' + fileRefId + ' /* SafeAreaContainerViewController.swift */,\n'
-      )
-      pbxproj = pbxproj.replace(
-        /\t\t\t\t504EC3081FED79650016851F \/\* AppDelegate\.swift in Sources \*\/,\n/,
-        '\t\t\t\t504EC3081FED79650016851F /* AppDelegate.swift in Sources */,\n\t\t\t\t' + buildFileId + ' /* SafeAreaContainerViewController.swift in Sources */,\n'
-      )
-      fs.writeFileSync(pbxprojPath, pbxproj)
-      console.log('[ios] registered SafeAreaContainerViewController.swift in Xcode project')
-    } else {
-      console.log('[ios] SafeAreaContainerViewController.swift already registered')
+    if (pbxproj.includes(fileName)) {
+      console.log(`[ios] ${fileName} already registered`)
+      return
     }
+    pbxproj = pbxproj.replace(
+      '/* Begin PBXBuildFile section */\n',
+      `/* Begin PBXBuildFile section */\n\t\t${buildFileId} /* ${fileName} in Sources */ = {isa = PBXBuildFile; fileRef = ${fileRefId} /* ${fileName} */; };\n`
+    )
+    pbxproj = pbxproj.replace(
+      '/* Begin PBXFileReference section */\n',
+      `/* Begin PBXFileReference section */\n\t\t${fileRefId} /* ${fileName} */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ${fileName}; sourceTree = "<group>"; };\n`
+    )
+    pbxproj = pbxproj.replace(
+      /\t\t\t\t504EC3071FED79650016851F \/\* AppDelegate\.swift \*\/,\n/,
+      '\t\t\t\t504EC3071FED79650016851F /* AppDelegate.swift */,\n\t\t\t\t' + fileRefId + ` /* ${fileName} */,\n`
+    )
+    pbxproj = pbxproj.replace(
+      /\t\t\t\t504EC3081FED79650016851F \/\* AppDelegate\.swift in Sources \*\/,\n/,
+      '\t\t\t\t504EC3081FED79650016851F /* AppDelegate.swift in Sources */,\n\t\t\t\t' + buildFileId + ` /* ${fileName} in Sources */,\n`
+    )
+    fs.writeFileSync(pbxprojPath, pbxproj)
+    console.log(`[ios] registered ${fileName} in Xcode project`)
+  }
+  if (fs.existsSync(pbxprojPath)) {
+    ensureSwiftFileRegistered('SafeAreaContainerViewController.swift', '5A1E000000000001000000A1', '5A1E000000000002000000A2')
+    ensureSwiftFileRegistered('ElectermSaveBridge.swift', '5A1E000000000003000000A3', '5A1E000000000004000000A4')
   }
 }
 
