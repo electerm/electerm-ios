@@ -1,6 +1,6 @@
 {
   "name": "electerm-ios",
-  "version": "5.5.10",
+  "version": "5.5.15",
   "description": "electerm for iOS — a free and open-source ssh/sftp/telnet/RDP/VNC/Spice/ftp client, built on the electerm-web codebase with Capacitor.",
   "main": "src/app/app.js",
   "type": "module",
@@ -48,7 +48,7 @@
   "preferGlobal": true,
   "devDependencies": {
     "@ant-design/icons": "^6.2.5",
-    "@electerm/electerm-react": "^5.5.9",
+    "@electerm/electerm-react": "^5.5.15",
     "@electerm/electerm-resource": "2.3.0",
     "@fontsource/maple-mono": "^5.2.6",
     "@novnc/novnc": "^1.7.0",
@@ -92,7 +92,7 @@
     "@electerm/electerm-themes": "^1.0.2",
     "@electerm/ftp-srv": "1.0.5",
     "@electerm/nedb": "^2.0.0",
-    "@electerm/ssh2": "1.22.0",
+    "@electerm/ssh2": "1.22.1",
     "@xterm/addon-serialize": "0.15.0-beta.292",
     "@xterm/headless": "6.1.0-beta.292",
     "axios": "1.18.1",
@@ -162,6 +162,7 @@
       "WebSocket",
       "FileReader",
       "CustomEvent",
+      "ResizeObserver",
       "onmessage",
       "self"
     ],
