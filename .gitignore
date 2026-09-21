@@ -121,8 +121,11 @@ dist
 .vscode
 .trae
 .workbuddy
+.workbuddy-ai
 __pycache__
 .catpawai
 build/ios/DerivedData
 /output
 build/ios/_www_old
+.kilo
+.codeartsdoer
