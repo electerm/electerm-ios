@@ -116,8 +116,12 @@ dist
 /test-results
 /data
 /data1
-# src/ is downloaded from electerm-android at install time (see build/bin/install.js)
+# src/ is downloaded from electerm-web at install time (see build/bin/install.js)
 /src/
+# What src/ was built from — the upstream electerm-web ref, the
+# @electerm/electerm-react version and a delta fingerprint. Written by
+# build/bin/install.js; a run whose three records all match skips the download.
+/install-records.ref
 .vscode
 .trae
 .workbuddy
