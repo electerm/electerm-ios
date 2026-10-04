@@ -22,7 +22,7 @@ import { applySrcOverrides } from './apply-src-overrides.mjs'
 
 const { echo, rm: shellRm, cp } = pkg
 
-const REPO = 'electerm/electerm-android'
+const REPO = 'electerm/electerm-web'
 const BRANCH = 'main'
 const URL = `https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}`
 const TMP = resolve('temp/electerm-android-src')
