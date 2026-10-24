@@ -110,16 +110,25 @@ jobs:
         # message-handler bridge instead. If the overlay copy above ever
         # silently stops landing these files, the build still succeeds but
         # downloads are broken with no error, so assert they are in place.
+        #
+        # Same story for the window-chrome bridge (status bar / home indicator
+        # colours from the UI theme): losing ElectermWindowChrome.swift gives an
+        # app that builds fine but shows system-white strips around a dark theme.
         run: |
           SWIFT=build/ios/ios/App/App/ElectermSaveBridge.swift
+          CHROME=build/ios/ios/App/App/ElectermWindowChrome.swift
           CONTAINER=build/ios/ios/App/App/SafeAreaContainerViewController.swift
           fail=0
           [ -f "$SWIFT" ] || {
             echo "::error::ElectermSaveBridge.swift missing at $SWIFT"; fail=1; }
           grep -q 'ElectermNative' "$CONTAINER" || {
             echo "::error::$CONTAINER does not install the ElectermNative bridge"; fail=1; }
+          [ -f "$CHROME" ] || {
+            echo "::error::ElectermWindowChrome.swift missing at $CHROME"; fail=1; }
+          grep -q 'ElectermWindowChrome.install' "$CONTAINER" || {
+            echo "::error::$CONTAINER does not install the ElectermChrome bridge"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
-          echo "native download bridge wired OK"
+          echo "native download + window chrome bridges wired OK"
 
       - name: Resolve Swift Package Manager dependencies
         run: |

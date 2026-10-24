@@ -10,7 +10,7 @@
  *
  * Steps:
  *   1. vite build the frontend  -> www/nodejs/dist/assets
- *   2. copy static assets (icons, images, views) into the node project
+ *   2. copy static assets (icons, images) into the node project
  *   3. esbuild bundle the backend -> www/nodejs/app.bundle.mjs. Native modules
  *      that are not built for iOS yet (node-pty, serialport, node-bash,
  *      font-list) are kept *external*: the source loads them via guarded
@@ -19,14 +19,18 @@
  *      logger (no `electron-log`). The on-device runtime is jitless Node 18
  *      (no WebAssembly), so the db layer uses the pure-JS nedb backend and
  *      `node:sqlite` is aliased to a throwing stub.
+ *   4. render the homepage to dist/assets/index.html (build/bin/gen-index-html.js),
+ *      so the pug compiler never has to run on the device.
  */
 import { build as viteBuild } from 'vite'
+import { createConfig, entryNames } from './vite.ios.mjs'
 import * as esbuild from 'esbuild'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { applySrcOverrides } from '../bin/apply-src-overrides.mjs'
+import { generateIndexHtml } from '../bin/gen-index-html.js'
 
 const require = createRequire(import.meta.url)
 const __filename = fileURLToPath(import.meta.url)
@@ -59,16 +63,80 @@ if (SERVER_SECRET === LOCAL_DEV_SECRET) {
   )
 }
 
+// The package.json the node project carries on the device. The server reads it
+// as `packInfo`, so the build-time homepage must embed the same object — not
+// this repo's package.json, which runtime-constants would otherwise pick up.
+const NODE_PKG = {
+  name: 'electerm-node',
+  version: VERSION,
+  main: 'index.js',
+  type: 'module'
+}
+
 // --------------------------------------------------------------------------
 // 1. Frontend
 // --------------------------------------------------------------------------
+// The frontend is built once per entry with every dynamic import inlined
+// (see vite.ios.mjs): on the device each asset is an HTTP round trip through
+// the single-threaded node server, so ~250 chunks with 138 of them on the
+// first screen cost ~2 s of launch time. 3 files cost ~0.
+const VITE_TMP = path.resolve(__dirname, '.gen', 'vite')
+
+function rmrfMaybe (dir) {
+  fs.rmSync(dir, { recursive: true, force: true })
+}
+
 async function runVite () {
   console.log('[ios] building frontend (vite)…')
-  await viteBuild({
-    configFile: path.resolve(__dirname, 'vite.ios.mjs'),
-    root: ROOT,
-    logLevel: 'warn'
-  })
+  rmrfMaybe(VITE_TMP)
+  for (const name of entryNames) {
+    const outDir = path.resolve(VITE_TMP, name, 'assets')
+    await viteBuild({
+      ...createConfig(name, outDir),
+      logLevel: 'warn'
+    })
+  }
+
+  // Assemble dist/assets from the per-entry outputs.
+  const assets = path.resolve(NODEJS_DIR, 'dist', 'assets')
+  // A stale chunk/ directory from an older build would still be packed into
+  // the app bundle even though nothing references it any more.
+  for (const stale of ['js', 'chunk', 'css']) {
+    rmrfMaybe(path.resolve(assets, stale))
+  }
+  fs.mkdirSync(assets, { recursive: true })
+  const cssParts = []
+  for (const name of entryNames) {
+    const out = path.resolve(VITE_TMP, name, 'assets')
+    if (!fs.existsSync(out)) {
+      continue
+    }
+    for (const entry of fs.readdirSync(out)) {
+      const from = path.join(out, entry)
+      if (entry === 'css') {
+        // cssCodeSplit:false gives one file per entry; the html only links
+        // css/style-<version>.css, so the entries have to be concatenated.
+        for (const file of fs.readdirSync(from).sort()) {
+          cssParts.push(fs.readFileSync(path.join(from, file), 'utf8'))
+        }
+      } else if (fs.statSync(from).isDirectory()) {
+        copyDir(from, path.resolve(assets, entry))
+      } else {
+        fs.copyFileSync(from, path.resolve(assets, entry))
+      }
+    }
+  }
+  if (cssParts.length) {
+    fs.mkdirSync(path.resolve(assets, 'css'), { recursive: true })
+    fs.writeFileSync(
+      path.resolve(assets, 'css', `style-${VERSION}.css`),
+      cssParts.join('\n')
+    )
+  }
+  const jsCount = fs
+    .readdirSync(path.resolve(assets, 'js'))
+    .filter(f => f.endsWith('.js')).length
+  console.log(`[ios] frontend: ${jsCount} js file(s), ${cssParts.length} css file(s) merged`)
 }
 
 // --------------------------------------------------------------------------
@@ -106,11 +174,9 @@ function copyFrontendAssets () {
     path.resolve(assets, 'images')
   )
 
-  fs.mkdirSync(path.resolve(NODEJS_DIR, 'views'), { recursive: true })
-  fs.copyFileSync(
-    path.resolve(ROOT, 'src/app/views/index.pug'),
-    path.resolve(NODEJS_DIR, 'views/index.pug')
-  )
+  // No `views/` in the node project: the homepage is rendered to
+  // dist/assets/index.html at build time (build/bin/gen-index-html.js) and the
+  // runtime never reads a template from disk.
 }
 
 function writeLoadingPage () {
@@ -146,39 +212,64 @@ function writeLoadingPage () {
     // A top-level navigation is NOT a subresource (PNA does not apply) and the
     // network-security-config permits cleartext to 127.0.0.1, so once the engine
     // is up we navigate. allowNavigation:["127.0.0.1"] keeps it in-app.
+    //
+    // The engine does NOT start in a second: the plugin unpacks the node project
+    // and the 7-8 MB server bundle has to be parsed (11-15 s measured on the
+    // Android emulator; the iOS simulator is in the same range). So navigation
+    // is driven by a probe that keeps retrying, never by a fixed timer: a blind
+    // navigation fired while the port is still closed lands the WebView on its
+    // "cannot connect" page, which has no way back and makes a cold launch look
+    // broken.
     var PORT = 5577;
     var BASE = 'http://127.0.0.1:' + PORT + '/';
+    var RETRY_MS = 500;
+    var GIVE_UP_MS = 60000;
     var Http = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp;
+    var startedAt = Date.now();
     var done = false;
-    function go (src) {
+    var msg = document.getElementById('msg');
+    function go () {
       if (done) return;
       done = true;
+      msg.textContent = 'Loading…';
       location.replace(BASE);
     }
-    function tryLoad () {
+    function probeOnce () {
       if (Http) {
-        Http.get({ url: BASE })
-          .then(function (r) {
-            if (r && r.status >= 200 && r.status < 500) go('capacitorhttp');
-            else setTimeout(tryLoad, 700);
-          })
-          .catch(function () {
-            document.getElementById('msg').textContent = 'Waiting for engine…';
-            setTimeout(tryLoad, 700);
-          });
-      } else {
-        fetch(BASE, { mode: 'no-cors' })
-          .then(function () { go('fetch'); })
-          .catch(function () {
-            document.getElementById('msg').textContent = 'Waiting for engine…';
-            setTimeout(tryLoad, 700);
-          });
+        return Http.get({ url: BASE, connectTimeout: 1000, readTimeout: 1000 })
+          .then(function (r) { return !!(r && r.status >= 100 && r.status < 500); })
+          .catch(function () { return false; });
       }
+      return fetch(BASE, { mode: 'no-cors' })
+        .then(function () { return true; })
+        .catch(function () { return false; });
     }
-    tryLoad();
-    // Fallback: probes blocked on this device -> after the engine has had time
-    // to come up (~1-2s), navigate directly (works because navigation is exempt).
-    setTimeout(function () { go('timeout'); }, 4000);
+    function giveUp () {
+      var btn = document.createElement('button');
+      btn.textContent = 'Retry';
+      btn.style.cssText = 'margin-top:6px;padding:8px 18px;border:0;border-radius:6px;' +
+        'background:#4aa3ff;color:#0b1017;font-size:14px;font-weight:600';
+      btn.onclick = function () {
+        startedAt = Date.now();
+        btn.remove();
+        msg.textContent = 'Waiting for engine…';
+        tick();
+      };
+      msg.textContent = 'The engine did not start. ';
+      msg.appendChild(btn);
+    }
+    function tick () {
+      if (done) return;
+      probeOnce().then(function (ok) {
+        if (done) return;
+        if (ok) return go();
+        var waited = Date.now() - startedAt;
+        if (waited > GIVE_UP_MS) return giveUp();
+        msg.textContent = 'Waiting for engine… ' + Math.round(waited / 1000) + 's';
+        setTimeout(tick, RETRY_MS);
+      });
+    }
+    tick();
   </script>
 </body>
 </html>
@@ -283,7 +374,11 @@ async function bundleBackend (shimPath) {
       'node-pty',
       'serialport',
       'node-bash',
-      'font-list'
+      'font-list',
+      // Dev-only template engine (see server/server.js): the guarded
+      // `if (isDev) await import('pug')` must not pull the compiler into the
+      // device bundle — it is 1.5 MB of @babel/parser + @babel/types + acorn.
+      'pug'
     ],
     // Some bundled CJS deps (e.g. sql.js's initSqlJs) reference __dirname /
     // __filename, which don't exist in an ESM bundle. Define them from
@@ -293,7 +388,11 @@ async function bundleBackend (shimPath) {
     // to a private name for the same reason, and derive __dirname from a
     // directory URL.
     banner: {
-      js: "import { createRequire } from 'module'; import { fileURLToPath as __etu } from 'url'; const require = createRequire(import.meta.url); const __filename = __etu(import.meta.url); const __dirname = __etu(new URL('.', import.meta.url));"
+      // Every name the banner needs is aliased: src/app/widgets/user-widget.js
+      // imports createRequire by name, and a banner that also declares it makes
+      // the bundle fail to link ("Identifier 'createRequire' has already been
+      // declared"), so the on-device server never starts.
+      js: "import { createRequire as __cr } from 'module'; import { fileURLToPath as __etu } from 'url'; const require = __cr(import.meta.url); const __filename = __etu(import.meta.url); const __dirname = __etu(new URL('.', import.meta.url));"
     },
     plugins: [nativeNodePlugin, patchPathToRegexpPlugin],
     // keep node built-ins external; everything else is bundled
@@ -340,9 +439,8 @@ process.env.DISABLE_LOCAL_TERMINAL = '1'
 // nedb backend and view.js that nedb files are the primary store (no
 // "migrate nedb -> sqlite" banner).
 process.env.DISABLE_SQLITE = '1'
-// Tell the server where the pug views live (cwd is now the node project dir,
-// set above via process.chdir(__d)).
-process.env.VIEW_FOLDER = resolve(__d, 'views')
+// No VIEW_FOLDER: the one template is precompiled into dist/assets/index.html
+// at build time, and the runtime never renders a page.
 
 // The embedded engine is Node 18, where net.connect's autoSelectFamily
 // defaults to false: a hostname with an AAAA record gets a single IPv6
@@ -420,7 +518,7 @@ await import('./app.bundle.mjs')
   fs.writeFileSync(
     path.resolve(NODEJS_DIR, 'package.json'),
     JSON.stringify(
-      { name: 'electerm-node', version: VERSION, main: 'index.js', type: 'module' },
+      NODE_PKG,
       null,
       2
     )
@@ -448,6 +546,12 @@ await import('./app.bundle.mjs')
 // Capacitor's CAPBridgeViewController with safe-area constraints. The web
 // content then lays out inside the safe rect and env(safe-area-inset-*)
 // would even resolve to 0 — nothing in the web layer needs to change.
+//
+// Consequence: the two bands OUTSIDE the safe rect (status bar on top, home
+// indicator at the bottom) are the container view's own background, i.e. the
+// system default — white on a light-mode device. ElectermWindowChrome paints
+// them with the UI theme's colours instead (see window-chrome.js), which is why
+// this VC owns one and overrides preferredStatusBarStyle.
 const safeAreaContainerSwift = `import UIKit
 import Capacitor
 import WebKit
@@ -457,6 +561,16 @@ import WebKit
 /// web content itself to be safe-area aware.
 class SafeAreaContainerViewController: UIViewController {
   private let bridge = CAPBridgeViewController()
+
+  /// Paints the status-bar / home-indicator bands with the UI theme colours.
+  private var windowChrome: ElectermWindowChrome?
+
+  /// The bands are outside the web page, so the clock / battery colour has to
+  /// come from the strip colour too — dark glyphs on a light strip, light
+  /// glyphs on a dark one.
+  override var preferredStatusBarStyle: UIStatusBarStyle {
+    return windowChrome?.statusBarStyle ?? .lightContent
+  }
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -470,24 +584,41 @@ class SafeAreaContainerViewController: UIViewController {
       bridge.view.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor)
     ])
     bridge.didMove(toParent: self)
-    installSaveBridge()
+    // Added after the bridge view so the strips stay on top of it; they live in
+    // the safe-area bands, where the web view never draws.
+    windowChrome = ElectermWindowChrome(container: view)
+    windowChrome?.onColorsChanged = { [weak self] in
+      self?.setNeedsStatusBarAppearanceUpdate()
+    }
+    installBridges()
   }
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
-    // Re-attach: idempotent, and guarantees the bridge is present even if
+    // Re-attach: idempotent, and guarantees the bridges are present even if
     // the WebView was recreated while we were backgrounded.
-    installSaveBridge()
+    installBridges()
+    // A recreated WebView reloads the page, so the strips are re-painted as
+    // soon as the page reports its theme again; this covers the gap.
+    windowChrome?.refresh()
   }
 
-  /// Attach the native save bridge to Capacitor's WKWebView. The UI page is
+  /// Attach both native bridges to Capacitor's WKWebView. The UI page is
   /// served by the on-device Node backend (http://127.0.0.1:5577), outside
   /// Capacitor's own origin, so Capacitor never injects its plugin runtime
-  /// there and the browser download path cannot work. See ElectermSaveBridge.
-  private func installSaveBridge() {
+  /// there and every plugin silently falls back to its web implementation (a
+  /// no-op in a WebView). Anything that must reach native is one of these:
+  ///
+  ///   window.ElectermNative  ElectermSaveBridge    - public Documents save
+  ///   window.ElectermChrome  ElectermWindowChrome  - status-bar / home-indicator
+  ///                                                  colours from the UI theme
+  private func installBridges() {
     view.layoutIfNeeded()
     guard let webView = findWebView(in: bridge.view) else { return }
     ElectermSaveBridge.install(on: webView)
+    if let chrome = windowChrome {
+      ElectermWindowChrome.install(on: webView, chrome: chrome)
+    }
   }
 
   private func findWebView(in view: UIView) -> WKWebView? {
@@ -496,6 +627,212 @@ class SafeAreaContainerViewController: UIViewController {
       if let found = findWebView(in: subview) { return found }
     }
     return nil
+  }
+}
+`
+
+// ElectermWindowChrome.swift — the status-bar / home-indicator strips, painted
+// with the UI theme's own colours. Same feature as electerm-android's
+// ElectermWindowChrome.java; the page side is
+// build/replace/src/client/web-components/window-chrome.js.
+//
+// Bridge contract:
+//   window.ElectermChrome.getVersion() -> "1"
+//   window.ElectermChrome.setWindowChrome(topArgb, bottomArgb)   '#AARRGGBB'
+//     top    -> --main-dark, the tab bar / header it continues
+//     bottom -> --main, the footer (and main surface) it continues
+const electermWindowChromeSwift = `import UIKit
+import WebKit
+
+/// Window chrome — the two system strips that live OUTSIDE the web page.
+///
+/// Why this exists
+/// ---------------
+/// The status-bar band (top) and the home-indicator band (bottom) are not part
+/// of the web page: SafeAreaContainerViewController constrains the WebView to
+/// the safe area, so those bands are the container view's background. Left
+/// alone that is the system default — white on a light-mode device — so a dark
+/// electerm theme gets a white status bar and a white bottom strip, with
+/// near-invisible dark glyphs.
+///
+/// Two plain coloured views sit in exactly those bands and their colour comes
+/// from the UI theme:
+///   - the page reports the live --main-dark / --main through the
+///     ElectermChrome message handler (see window-chrome.js), so switching
+///     theme in settings re-paints the strips immediately;
+///   - the container's own background is kept in sync as well, so a band that
+///     is briefly taller than the strip (rotation, keyboard, first layout) does
+///     not flash white.
+/// The clock / battery appearance follows the top strip's luminance, so no
+/// separate foreground argument is needed.
+///
+/// Same feature as electerm-android's ElectermWindowChrome.java.
+final class ElectermWindowChrome: NSObject, WKScriptMessageHandler {
+
+  /// Version marker: lets the page feature-detect this bridge.
+  static let version = "1"
+  static let handlerName = "ElectermChrome"
+
+  /// Boot colours — electerm's dark default (#15171a), the same colour the
+  /// loading page and the launch screen use, so the hand-off from launch screen
+  /// to first frame shows no white flash.
+  private static let bootColor = UIColor(
+    red: 0x15 / 255.0,
+    green: 0x17 / 255.0,
+    blue: 0x1a / 255.0,
+    alpha: 1
+  )
+
+  /// Last colours reported by the page. Static so a recreated view controller
+  /// (WebView still on the old theme) keeps them instead of flashing the boot
+  /// colour.
+  private static var topColor = bootColor
+  private static var bottomColor = bootColor
+
+  private let topStrip = UIView()
+  private let bottomStrip = UIView()
+  private weak var container: UIView?
+
+  /// Called on the main thread whenever the colours change, so the view
+  /// controller can re-ask for the status-bar style.
+  var onColorsChanged: (() -> Void)?
+
+  /// Dark glyphs on a light strip, light glyphs on a dark one.
+  var statusBarStyle: UIStatusBarStyle {
+    return ElectermWindowChrome.isLight(ElectermWindowChrome.topColor)
+      ? .darkContent
+      : .lightContent
+  }
+
+  init(container: UIView) {
+    self.container = container
+    super.init()
+    for strip in [topStrip, bottomStrip] {
+      strip.translatesAutoresizingMaskIntoConstraints = false
+      // Purely decorative: never eat a touch meant for the page.
+      strip.isUserInteractionEnabled = false
+      container.addSubview(strip)
+    }
+    NSLayoutConstraint.activate([
+      topStrip.topAnchor.constraint(equalTo: container.topAnchor),
+      topStrip.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      topStrip.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      topStrip.bottomAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor),
+
+      bottomStrip.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.bottomAnchor),
+      bottomStrip.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      bottomStrip.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      bottomStrip.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+    ])
+    applyColors()
+  }
+
+  /// Attach the bridge to a WKWebView. Safe to call repeatedly: the message
+  /// handler is re-registered and the shim script is added once.
+  static func install(on webView: WKWebView, chrome: ElectermWindowChrome) {
+    let controllers = webView.configuration.userContentController
+    controllers.removeScriptMessageHandler(forName: handlerName)
+    controllers.add(chrome, name: handlerName)
+    let alreadyInjected = controllers.userScripts.contains { $0.source == shimScript }
+    if (!alreadyInjected) {
+      let script = WKUserScript(
+        source: shimScript,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+      )
+      controllers.addUserScript(script)
+    }
+    chrome.refresh()
+  }
+
+  /// Re-apply the current colours (view recreated / appeared).
+  func refresh() {
+    applyColors()
+  }
+
+  /// The page-side shim. WKWebView exposes only
+  /// window.webkit.messageHandlers, so window.ElectermChrome is a thin wrapper
+  /// that keeps the page code identical to the Android build's
+  /// @JavascriptInterface object.
+  private static let shimScript: String = """
+    (function () {
+      if (window.ElectermChrome && typeof window.ElectermChrome.setWindowChrome === 'function') return;
+      var handler = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ElectermChrome) || null;
+      if (!handler) return;
+      window.ElectermChrome = {
+        getVersion: function () { return "1"; },
+        setWindowChrome: function (topArgb, bottomArgb) {
+          handler.postMessage({ method: 'setWindowChrome', top: topArgb, bottom: bottomArgb });
+        }
+      };
+    })();
+    """
+
+  // MARK: - WKScriptMessageHandler
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    guard message.name == Self.handlerName,
+          let body = message.body as? [String: Any],
+          let method = body["method"] as? String,
+          method == "setWindowChrome" else { return }
+    // Invalid / missing colours keep the previous value instead of clearing it.
+    let top = Self.parseColor(body["top"] as? String)
+    let bottom = Self.parseColor(body["bottom"] as? String)
+    DispatchQueue.main.async { [weak self] in
+      if let top = top { Self.topColor = top }
+      if let bottom = bottom { Self.bottomColor = bottom }
+      self?.applyColors()
+    }
+  }
+
+  // MARK: - internals
+
+  private func applyColors() {
+    let top = Self.topColor
+    let bottom = Self.bottomColor
+    topStrip.backgroundColor = top
+    bottomStrip.backgroundColor = bottom
+    // The strips cover the bands, but a band can be briefly taller than its
+    // strip (rotation, keyboard animation); the container background is what
+    // shows through then.
+    container?.backgroundColor = bottom
+    onColorsChanged?()
+  }
+
+  /// '#RRGGBB' / '#AARRGGBB' -> opaque UIColor, or nil when unusable.
+  /// The alpha byte is accepted and ignored: a translucent strip would show the
+  /// system default through it, which is the whole problem.
+  private static func parseColor(_ value: String?) -> UIColor? {
+    guard var hex = value?.trimmingCharacters(in: .whitespacesAndNewlines), !hex.isEmpty else {
+      return nil
+    }
+    if hex.hasPrefix("#") {
+      hex.removeFirst()
+    }
+    guard hex.count == 6 || hex.count == 8, let number = UInt32(hex, radix: 16) else {
+      return nil
+    }
+    let rgb = hex.count == 8 ? (number & 0x00FFFFFF) : number
+    return UIColor(
+      red: CGFloat((rgb >> 16) & 0xFF) / 255.0,
+      green: CGFloat((rgb >> 8) & 0xFF) / 255.0,
+      blue: CGFloat(rgb & 0xFF) / 255.0,
+      alpha: 1
+    )
+  }
+
+  /// True when the strip is light enough to need dark system-bar glyphs.
+  /// Straight sRGB luminance weighting — enough to pick between two options.
+  private static func isLight(_ color: UIColor) -> Bool {
+    var r: CGFloat = 0
+    var g: CGFloat = 0
+    var b: CGFloat = 0
+    var a: CGFloat = 0
+    guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return false }
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 0.6
   }
 }
 `
@@ -967,6 +1304,42 @@ function applyResOverlay () {
   fs.writeFileSync(saveBridgePath, electermSaveBridgeSwift)
   console.log('[ios] refreshed ElectermSaveBridge.swift')
 
+  // ── Window chrome bridge (theme -> status bar / home indicator) ───────
+  // Writes ElectermWindowChrome.swift into the app target. The status-bar and
+  // home-indicator bands live outside the WebView (the container keeps it
+  // inside the safe area), so the page has to hand their colours over. Losing
+  // this file builds fine and silently gives the app system-white strips
+  // around a dark theme. See
+  // build/replace/src/client/web-components/window-chrome.js.
+  const chromeBridgePath = path.resolve(__dirname, 'ios', 'App', 'App', 'ElectermWindowChrome.swift')
+  fs.writeFileSync(chromeBridgePath, electermWindowChromeSwift)
+  console.log('[ios] refreshed ElectermWindowChrome.swift')
+
+  // ── Launch screen background ──────────────────────────────────────────
+  // Capacitor's template paints the launch screen with
+  // systemBackgroundColor, which is white in light mode: the first thing a
+  // cold launch shows is a white flash, then the dark loading page. Paint it
+  // with electerm's dark background instead (same idea as Android's
+  // windowSplashScreenBackground). The splash image still sits on top; this
+  // only fixes the letterboxed areas and the instant before it decodes.
+  const launchPath = path.resolve(__dirname, 'ios', 'App', 'App', 'Base.lproj', 'LaunchScreen.storyboard')
+  if (fs.existsSync(launchPath)) {
+    const launch = fs.readFileSync(launchPath, 'utf8')
+    const darkColor = '<color key="backgroundColor" red="0.08235294117647059" green="0.09019607843137255" blue="0.10196078431372549" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>'
+    const patched = launch.replace(
+      /<color key="backgroundColor" systemColor="systemBackgroundColor"\/>/g,
+      darkColor
+    )
+    if (patched !== launch) {
+      fs.writeFileSync(launchPath, patched)
+      console.log('[ios] patched LaunchScreen background to electerm dark')
+    } else if (launch.includes(darkColor)) {
+      console.log('[ios] LaunchScreen background already dark')
+    } else {
+      console.warn('[ios] WARNING: could not find the LaunchScreen background colour — patch skipped')
+    }
+  }
+
   // ── Register SafeAreaContainerViewController.swift in the Xcode project ──
   // The project uses explicit file lists (not synchronized folders), so the
   // new Swift file must be added in 4 places in project.pbxproj: as a build
@@ -1000,6 +1373,7 @@ function applyResOverlay () {
   if (fs.existsSync(pbxprojPath)) {
     ensureSwiftFileRegistered('SafeAreaContainerViewController.swift', '5A1E000000000001000000A1', '5A1E000000000002000000A2')
     ensureSwiftFileRegistered('ElectermSaveBridge.swift', '5A1E000000000003000000A3', '5A1E000000000004000000A4')
+    ensureSwiftFileRegistered('ElectermWindowChrome.swift', '5A1E000000000005000000A5', '5A1E000000000006000000A6')
   }
 }
 
@@ -1023,6 +1397,16 @@ async function main () {
 
   await runVite()
   copyFrontendAssets()
+  // Static homepage. Must run after runVite(), which recreates dist/assets.
+  const index = await generateIndexHtml({
+    outDir: path.resolve(NODEJS_DIR, 'dist', 'assets'),
+    secret: SERVER_SECRET,
+    user: process.env.SERVER_USER,
+    packInfo: NODE_PKG
+  })
+  console.log(
+    `[ios] homepage: ${path.relative(ROOT, index.outPath)} (${index.bytes} bytes)`
+  )
   writeLoadingPage()
 
   const shimPath = genSqliteStub()

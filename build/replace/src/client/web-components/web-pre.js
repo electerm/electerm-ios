@@ -1,6 +1,7 @@
 import * as path from './path.js'
 import message from '../electerm-react/components/common/message'
 import { installDownloadFromBrowserHook } from './native-file-save.js'
+import { installWindowChromeSync } from './window-chrome.js'
 
 const {
   ipcOnEvent,
@@ -257,9 +258,16 @@ require.resolve = name => name
 
 window.require = require
 
-// Android WebView has no handling for blob: URLs / `<a download>`, so the
-// stock "download from browser" flow silently does nothing there. Install a
-// native saver (MediaStore/Downloads via @capgo/capacitor-file-sharer, with
-// blob-anchor fallback on plain web) — sftp/file-item.jsx calls it through
+// iOS WKWebView has no handling for blob: URLs / `<a download>`, so the stock
+// "download from browser" flow silently does nothing there. Install a native
+// saver (Documents via @capgo/capacitor-file-sharer, with blob-anchor fallback
+// on plain web) — sftp/file-item.jsx calls it through
 // `window.et.downloadFromBrowser(path)`.
 installDownloadFromBrowserHook()
+
+// iOS only: keep the status-bar / home-indicator strips painted with the
+// *theme's* --main-dark / --main instead of the system light/dark default.
+// Those strips live outside the web page (the WebView is constrained to the
+// safe area), and this is the only place that knows the live theme colours.
+// No-op on a plain browser.
+installWindowChromeSync()
