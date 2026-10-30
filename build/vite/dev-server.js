@@ -18,6 +18,7 @@ import proxy from 'express-http-proxy'
 import fsFunctions from '../../src/app/common/fs-functions.js'
 import { createToken } from '../../src/app/lib/jwt.js'
 import { logDir } from '../../src/app/server/session-log.js'
+import { resolve } from 'path'
 
 const devPort = env.DEV_PORT || 5570
 const devHost = env.DEV_HOST || '127.0.0.1'
@@ -101,6 +102,12 @@ async function createServer () {
       hmr: {
         overlay: true,
         port: env.DEV_HMR_PORT || 23589
+      },
+      watch: {
+        ignored: [
+          resolve(cwd, 'data'),
+          resolve(cwd, 'data1')
+        ]
       }
     },
     appType: 'custom'
