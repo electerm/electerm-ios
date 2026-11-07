@@ -20,6 +20,7 @@ import {
 import { createToken } from './jwt.js'
 import { logDir } from '../server/session-log.js'
 import { buildViewData } from './view-data.js'
+import { getIconDir } from './icon-download.js'
 
 function buildServer () {
   return `http://${process.env.HOST}:${process.env.PORT}`
@@ -36,6 +37,9 @@ export async function index (req, res) {
     server,
     home,
     sessionLogPath: logDir,
+    // the folder the downloaded bookmark icons live in; the client needs it to
+    // tell a path that has a url (routes/icon.js) from one that does not
+    iconDir: getIconDir(),
     query: req.query,
     // The web UI auto-logs-in while ENABLE_AUTH is unset, which is how a
     // password-less install gets a usable API token.

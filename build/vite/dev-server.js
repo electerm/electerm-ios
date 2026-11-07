@@ -18,6 +18,7 @@ import proxy from 'express-http-proxy'
 import fsFunctions from '../../src/app/common/fs-functions.js'
 import { createToken } from '../../src/app/lib/jwt.js'
 import { logDir } from '../../src/app/server/session-log.js'
+import { getIconDir } from '../../src/app/lib/icon-download.js'
 import { resolve } from 'path'
 
 const devPort = env.DEV_PORT || 5570
@@ -56,6 +57,10 @@ const base = {
   cdn: h,
   isWebApp: true,
   sessionLogPath: logDir,
+  // same as src/app/lib/view.js: the browser reads a downloaded bookmark icon
+  // over http instead of inlining the file
+  iconServePath: '/api/icon/',
+  iconDir: getIconDir(),
   tokenElecterm: process.env.ENABLE_AUTH ? '' : createToken(),
   disableUpgradeCheck: true,
   hideLocalTerminal: true,
@@ -156,6 +161,16 @@ async function createServer () {
   )
   app.use(
     '/api/download',
+    proxy(tar, {
+      proxyReqPathResolver: function (req) {
+        return req.originalUrl
+      }
+    })
+  )
+  // a bookmark icon downloaded into <data dir>/icons, see
+  // src/app/routes/icon.js; an <img> asks for it without a token
+  app.use(
+    '/api/icon',
     proxy(tar, {
       proxyReqPathResolver: function (req) {
         return req.originalUrl
