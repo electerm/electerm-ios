@@ -37,6 +37,52 @@ if (typeof window.requestIdleCallback !== 'function') {
 }
 
 const { isDev, version, cdn } = window.et
+const basePath = window.et.basePath || ''
+
+// Where the socket lives, and which path prefix it carries.
+// - an explicit `server` wins (cross-origin app server, or a dev setup pointing
+//   at another machine). It may already include the app root, so its path is
+//   used instead of the configured sub-path, never on top of it;
+// - dev otherwise: the socket has to reach the app server directly, because the
+//   vite dev server proxies http but not upgrades, and the app runs on another
+//   port than the page. Same host the page was reached on (HOST may be 0.0.0.0,
+//   which no browser can connect to) plus the app port: the session's one when
+//   the server reports it, else the port the dev server proxies `/api` to;
+// - prod: the page origin, the only one that knows the sub-path.
+function wsTarget (host, port) {
+  const { protocol, hostname, host: pageHost } = window.location
+  const secure = protocol === 'https:'
+  const server = window.et.server
+  if (server) {
+    try {
+      const u = new URL(server, window.location.href)
+      const path = u.pathname.replace(/\/+$/, '')
+      return {
+        origin: u.host,
+        secure: u.protocol === 'https:',
+        prefix: path || basePath
+      }
+    } catch (e) {
+      return {
+        origin: server.replace(/^https?:\/\//, '').replace(/\/+$/, ''),
+        secure: server.startsWith('https'),
+        prefix: basePath
+      }
+    }
+  }
+  const appPort = port || window.et.serverPort
+  // `0.0.0.0`/`::` means "every interface" — fine to listen on, useless to
+  // connect to. Fall back to the host the page was reached on, then localhost.
+  const unusable = h => !h || h === '0.0.0.0' || h === '::' || h === '[::]'
+  const appHost = unusable(host) ? (unusable(hostname) ? '127.0.0.1' : hostname) : host
+  return {
+    origin: isDev && appPort
+      ? `${appHost}:${appPort}`
+      : pageHost,
+    secure,
+    prefix: basePath
+  }
+}
 
 window.et.buildWsUrl = (
   host,
@@ -46,12 +92,9 @@ window.et.buildWsUrl = (
   type = 'terminals',
   extra = ''
 ) => {
-  const ss = isDev ? window.et.server : window.location.href
-  const s = ss
-    ? ss.replace(/https?:\/\//, '').replace(/\/$/, '')
-    : `${host}:${port}`
-  const pre = ss.startsWith('https') ? 'wss' : 'ws'
-  return `${pre}://${s}/${type}/${id}?token=${tokenElecterm}${extra}`
+  const { origin, secure, prefix } = wsTarget(host, port)
+  const pre = secure ? 'wss' : 'ws'
+  return `${pre}://${origin}${prefix}/${type}/${id}?token=${tokenElecterm}${extra}`
 }
 
 async function loadWorker () {
