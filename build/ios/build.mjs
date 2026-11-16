@@ -411,7 +411,7 @@ function copyEnv () {
 function writeNodeEntry () {
   const entry = `import { resolve } from 'node:path'
 import fs, { mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import os, { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const __d = fileURLToPath(new URL('.', import.meta.url))
@@ -511,6 +511,34 @@ process.env.DB_PATH = userDataDir
 const sshDir = resolve(userDataDir, '.ssh')
 mkdirSync(sshDir, { recursive: true })
 process.env.HOME = userDataDir
+
+// Keep a writable temp root inside the user-data dir. A widget install from a
+// URL stages its download with
+//   fs.mkdtempSync(join(os.tmpdir(), 'electerm-widget-'))
+// which fails with ENOENT/EACCES when the temp root is missing or read-only —
+// that is exactly what happened on Android (see the matching block in
+// build/android/build.mjs). The engine there ignored TMPDIR for os.tmpdir(),
+// so override the function as well, but only when the current temp dir is
+// really unusable: on iOS the OS normally supplies a valid sandbox TMPDIR and
+// that one should keep winning (its contents are not backed up to iCloud).
+const tmpUsable = (() => {
+  try {
+    fs.accessSync(os.tmpdir(), fs.constants.W_OK)
+    return true
+  } catch (e) {
+    return false
+  }
+})()
+if (!tmpUsable) {
+  const tmpDir = resolve(userDataDir, 'tmp')
+  mkdirSync(tmpDir, { recursive: true })
+  process.env.TMPDIR = tmpDir
+  process.env.TMP = tmpDir
+  process.env.TEMP = tmpDir
+  // The embedded engine can ignore TMPDIR for os.tmpdir() (verified on
+  // Android: env set, os.tmpdir() still "/tmp"), so patch the function too.
+  os.tmpdir = () => tmpDir
+}
 
 await import('./app.bundle.mjs')
 `
