@@ -46,12 +46,6 @@ jobs:
         run: npm --prefix build/ios install
 
       - name: Build web frontend + Node.js backend bundle
-        env:
-          # JWT secret for the on-device electerm server. Optional — build.mjs
-          # falls back to a random key when not provided. Set it for
-          # reproducible production builds:
-          #   gh secret set SERVER_SECRET --body "$(openssl rand -hex 32)"
-          SERVER_SECRET: ${{ secrets.SERVER_SECRET }}
         run: npm run build:ios
 
       - name: Bypass Capacitor appId validation (Apple allows dashes, Capacitor does not)

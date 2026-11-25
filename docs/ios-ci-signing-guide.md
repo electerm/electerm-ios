@@ -29,7 +29,6 @@ a signed IPA and upload it to App Store Connect automatically.
 | `APPLE_ID` | Your Apple ID email (e.g. `zxdong@gmail.com`) | ✅ Yes |
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for `altool` upload | ✅ Yes (or use API key) |
 | `APPLE_TEAM_ID` | Your Apple Developer Team ID | ✅ Yes |
-| `SERVER_SECRET` | JWT secret for on-device electerm server | Optional |
 | `APP_STORE_CONNECT_API_KEY_P8` | App Store Connect API key (.p8), base64-encoded | Optional (recommended) |
 | `APP_STORE_CONNECT_ISSUER_ID` | App Store Connect API issuer ID | Optional (with API key) |
 | `APP_STORE_CONNECT_KEY_ID` | App Store Connect API key ID | Optional (with API key) |
@@ -252,23 +251,6 @@ gh secret set APP_STORE_CONNECT_KEY_ID --body "ABC123DEF4"
 
 ---
 
-## Step 7 (Optional): Set SERVER_SECRET
-
-The `SERVER_SECRET` is a JWT signing key baked into the app at build
-time. It's used by the on-device electerm Node.js server to sign JWT
-tokens for its own API. If not provided, the CI generates a random one
-each build (which is fine — tokens don't persist across app launches).
-
-For reproducible builds, set a fixed secret:
-
-```bash
-openssl rand -hex 32
-# Copy the output and set it:
-gh secret set SERVER_SECRET --body "the_hex_string_from_above"
-```
-
----
-
 ## Complete Secret-Setting Commands (Copy & Paste)
 
 ```bash
@@ -294,8 +276,6 @@ gh secret set APP_STORE_CONNECT_API_KEY_P8 --body "$(pbpaste)"
 gh secret set APP_STORE_CONNECT_ISSUER_ID --body "2f1c2a3b-..."
 gh secret set APP_STORE_CONNECT_KEY_ID --body "ABC123DEF4"
 
-# 5. (Optional) Server secret
-gh secret set SERVER_SECRET --body "$(openssl rand -hex 32)"
 ```
 
 ---

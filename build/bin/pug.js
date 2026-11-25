@@ -38,7 +38,6 @@ const data = {
   siteName: pack.name,
   isDev: false,
   cdn: '',
-  tokenElecterm: '',
   enableAIFlag: true,
   defaultAIPreset
 }

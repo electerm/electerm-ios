@@ -28,11 +28,9 @@ import * as esbuild from 'esbuild'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
 import { applySrcOverrides } from '../bin/apply-src-overrides.mjs'
 import { generateIndexHtml } from '../bin/gen-index-html.js'
 
-const require = createRequire(import.meta.url)
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const ROOT = path.resolve(__dirname, '..', '..') // build/ios -> repo root
@@ -46,22 +44,6 @@ const NODEJS_DIR = path.resolve(WWW, 'nodejs')
 const VERSION = JSON.parse(
   fs.readFileSync(path.resolve(ROOT, 'package.json'), 'utf8')
 ).version
-
-// JWT secret for the on-device server.
-// In CI (GitHub Actions) SERVER_SECRET should come from the repository secret,
-// but to keep the build self-contained we fall back to a fresh random key when
-// it is not provided. For local development a fixed fallback value is used.
-const LOCAL_DEV_SECRET = 'electerm-ios-local-dev-secret'
-const SERVER_SECRET = process.env.SERVER_SECRET ||
-  (process.env.CI
-    ? require('crypto').randomBytes(32).toString('hex')
-    : LOCAL_DEV_SECRET)
-if (SERVER_SECRET === LOCAL_DEV_SECRET) {
-  console.warn(
-    '[ios] WARNING: using insecure local-dev SERVER_SECRET fallback. ' +
-    'Set the SERVER_SECRET GitHub Actions secret for production builds.'
-  )
-}
 
 // The package.json the node project carries on the device. The server reads it
 // as `packInfo`, so the build-time homepage must embed the same object — not
@@ -428,10 +410,6 @@ process.chdir(__d)
 process.env.NODE_ENV = 'production'
 process.env.HOST = '127.0.0.1'
 process.env.PORT = '5577'
-// JWT secret baked in at build time. In CI this comes from the SERVER_SECRET
-// GitHub Action secret; locally it falls back to a fixed dev value.
-// The web UI auto-logs-in because ENABLE_AUTH is not set.
-process.env.SERVER_SECRET = ${JSON.stringify(SERVER_SECRET)}
 // No real pty on iOS -> disable the local terminal feature.
 process.env.DISABLE_LOCAL_TERMINAL = '1'
 // The on-device Node.js engine runs jitless (no WebAssembly), so the
@@ -871,7 +849,7 @@ final class ElectermWindowChrome: NSObject, WKScriptMessageHandler {
 // reach the build). Keep this template in sync with the protocol expected by
 // build/replace/src/client/web-components/native-file-save.js:
 //   window.ElectermNative.getVersion() -> "1"
-//   saveUrl(url, token, fallbackName, callbackId)
+//   saveUrl(url, fallbackName, callbackId)
 //   saveBase64(filename, base64Data, contentType, callbackId)
 // Results are reported via window.__etNativeSaveResult(callbackId, ok,
 // dataJson, errorString). Files land in the app's Documents directory, which
@@ -895,8 +873,8 @@ import WebKit
 /// ------------
 /// Injects \`window.ElectermNative\` (WKUserScript, document start) backed
 /// by a WKScriptMessageHandler:
-///   saveUrl(url, token, fallbackName, callbackId)
-///     Fetches the /api/download response (token header included) and writes
+///   saveUrl(url, fallbackName, callbackId)
+///     Fetches the /api/download response and writes
 ///     it to Documents. Streamed to disk via URLSession download task, so big
 ///     files and directory tarballs never pass through JS memory.
 ///   saveBase64(filename, base64Data, contentType, callbackId)
@@ -922,8 +900,8 @@ class ElectermSaveBridge: NSObject, WKScriptMessageHandler {
       if (!handler) return;
       window.ElectermNative = {
         getVersion: function () { return "1"; },
-        saveUrl: function (url, token, fallbackName, callbackId) {
-          handler.postMessage({ method: 'saveUrl', url: url, token: token, fallbackName: fallbackName, callbackId: callbackId });
+        saveUrl: function (url, fallbackName, callbackId) {
+          handler.postMessage({ method: 'saveUrl', url: url, fallbackName: fallbackName, callbackId: callbackId });
         },
         saveBase64: function (filename, base64Data, contentType, callbackId) {
           handler.postMessage({ method: 'saveBase64', filename: filename, base64Data: base64Data, contentType: contentType, callbackId: callbackId });
@@ -981,14 +959,10 @@ class ElectermSaveBridge: NSObject, WKScriptMessageHandler {
     guard let urlString = body["url"] as? String, let url = URL(string: urlString) else {
       throw BridgeError.message("invalid url")
     }
-    let token = body["token"] as? String ?? ""
     let fallback = sanitize(body["fallbackName"] as? String ?? "download")
 
     var request = URLRequest(url: url, timeoutInterval: 120)
     request.httpMethod = "GET"
-    if (!token.isEmpty) {
-      request.setValue(token, forHTTPHeaderField: "token")
-    }
     let (tempURL, response) = try perform(request: request)
     defer { try? FileManager.default.removeItem(at: tempURL) }
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -1428,8 +1402,6 @@ async function main () {
   // Static homepage. Must run after runVite(), which recreates dist/assets.
   const index = await generateIndexHtml({
     outDir: path.resolve(NODEJS_DIR, 'dist', 'assets'),
-    secret: SERVER_SECRET,
-    user: process.env.SERVER_USER,
     packInfo: NODE_PKG
   })
   console.log(

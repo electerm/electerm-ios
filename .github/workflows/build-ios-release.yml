@@ -7,7 +7,6 @@
 #   APPLE_ID                          – Apple ID email address
 #   APPLE_APP_SPECIFIC_PASSWORD       – app-specific password for altool upload
 #   APPLE_TEAM_ID                     – Apple Developer Team ID (e.g. 38ZYC7L6N5)
-#   SERVER_SECRET                     – JWT secret for the on-device electerm server (optional, random if unset)
 #
 # Optional secrets:
 #   APP_STORE_CONNECT_API_KEY_P8      – App Store Connect API key (.p8), base64-encoded (alternative upload method)
@@ -57,8 +56,6 @@ jobs:
         run: npm --prefix build/ios install
 
       - name: Build web frontend + Node.js backend bundle
-        env:
-          SERVER_SECRET: ${{ secrets.SERVER_SECRET }}
         run: npm run build:ios
 
       - name: Bypass Capacitor appId validation (Apple allows dashes, Capacitor does not)
